@@ -337,6 +337,7 @@ class TTSFactory(object):
     from mycroft.tts.mary_tts import MaryTTS
     from mycroft.tts.mimic_tts import Mimic
     from mycroft.tts.spdsay_tts import SpdSay
+    from mycroft.tts.ibm_tts import IBMTTS
 
     CLASSES = {
         "mimic": Mimic,
@@ -344,7 +345,8 @@ class TTSFactory(object):
         "marytts": MaryTTS,
         "fatts": FATTS,
         "espeak": ESpeak,
-        "spdsay": SpdSay
+        "spdsay": SpdSay,
+        "ibmtts": IBMTTS
     }
 
     @staticmethod
@@ -365,11 +367,16 @@ class TTSFactory(object):
         module = config.get('module', 'mimic')
         lang = config.get(module).get('lang')
         voice = config.get(module).get('voice')
+        username = config.get(module).get('username')
+        password = config.get(module).get('password')
+        timeout = config.get(module).get('timeout')
         clazz = TTSFactory.CLASSES.get(module)
 
         if issubclass(clazz, RemoteTTS):
             url = config.get(module).get('url')
             tts = clazz(lang, voice, url)
+        elif module == "ibmtts":
+            tts = clazz(lang, voice, username, password, timeout)
         else:
             tts = clazz(lang, voice)
 
