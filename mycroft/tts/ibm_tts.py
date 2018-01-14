@@ -42,4 +42,3 @@ class IBMTTSValidator(TTSValidator):
 	
     def get_tts_class(self):
         return IBMTTS
-
