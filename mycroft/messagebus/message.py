@@ -74,7 +74,7 @@ class Message(object):
         obj = json.loads(value)
         return Message(obj.get('type'), obj.get('data'), obj.get('context'))
 
-    def reply(self, type, data, context=None):
+    def reply(self, type, data=None, context=None):
         """Construct a reply message for a given message
 
         This will take the same parameters as a message object but use
@@ -94,6 +94,7 @@ class Message(object):
         Returns:
             Message: Message object to be used on the reply to the message
         """
+        data = data or {}
         context = context or {}
 
         new_context = self.context if self.context else {}
@@ -104,6 +105,22 @@ class Message(object):
         elif 'client_name' in context:
             context['target'] = context['client_name']
         return Message(type, data, context=new_context)
+
+    def response(self, data=None, context=None):
+        """Construct a response message for the message
+
+        Constructs a reply with the data and appends the expected
+        ".response" to the message
+
+        Args:
+            data (dict): message data
+            context (dict): message context
+        Returns
+            (Message) message with the type modified to match default response
+        """
+        response_message = self.reply(self.type, data or {}, context)
+        response_message.type += '.response'
+        return response_message
 
     def publish(self, type, data, context=None):
         """
@@ -140,8 +157,8 @@ class Message(object):
         Returns:
             str: Leftover words or None if not an utterance.
         """
-        utt = self.data.get("utterance", None)
+        utt = normalize(self.data.get("utterance", ""))
         if utt and "__tags__" in self.data:
             for token in self.data["__tags__"]:
-                utt = utt.replace(token["key"], "")
+                utt = utt.replace(token.get("key", ""), "")
         return normalize(utt)

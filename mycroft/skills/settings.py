@@ -59,23 +59,22 @@
 """
 
 import json
-import subprocess
 import hashlib
 from threading import Timer
-from os.path import isfile, join, expanduser, basename
+from os.path import isfile, join, expanduser
 
-from mycroft.api import DeviceApi
+from mycroft.api import DeviceApi, is_paired
 from mycroft.util.log import LOG
 from mycroft.configuration import ConfigurationManager
 
 
 class SkillSettings(dict):
-    """ A dictionary that can easily be save to a file, serialized as json. It
+    """ Dictionary that can easily be saved to a file, serialized as json. It
         also syncs to the backend for skill settings
 
-        Args:
-            directory (str): Path to storage directory
-            name (str):      user readable name associated with the settings
+    Args:
+        directory (str): Path to storage directory
+        name (str):      user readable name associated with the settings
     """
 
     def __init__(self, directory, name):
@@ -89,20 +88,41 @@ class SkillSettings(dict):
         self.api = DeviceApi()
         self.config = ConfigurationManager.get()
         self.name = name
-        self.directory = directory
         # set file paths
         self._settings_path = join(directory, 'settings.json')
         self._meta_path = join(directory, 'settingsmeta.json')
         self.is_alive = True
-        self.loaded_hash = hash(str(self))
+        self.loaded_hash = hash(json.dumps(self, sort_keys=True))
         self._complete_intialization = False
         self._device_identity = None
         self._api_path = None
         self._user_identity = None
+        self.changed_callback = None
+        self._poll_timer = None
+        self._is_alive = True
 
         # if settingsmeta exist
         if isfile(self._meta_path):
             self._poll_skill_settings()
+
+    def run_poll(self, _=None):
+        """Immediately poll the web for new skill settings"""
+        if self._poll_timer:
+            self._poll_timer.cancel()
+            self._poll_skill_settings()
+
+    def stop_polling(self):
+        self._is_alive = False
+        if self._poll_timer:
+            self._poll_timer.cancel()
+
+    def set_changed_callback(self, callback):
+        """ Set callback to perform when server settings have changed.
+
+        Args:
+            callback: function/method to call when settings have changed
+        """
+        self.changed_callback = callback
 
     # TODO: break this up into two classes
     def initialize_remote_settings(self):
@@ -115,11 +135,14 @@ class SkillSettings(dict):
         if not settings_meta:
             return
 
+        if not is_paired():
+            return
+
         self._device_identity = self.api.identity.uuid
         self._api_path = "/" + self._device_identity + "/skill"
         self._user_identity = self.api.get()['user']['uuid']
-        LOG.info("settingsmeta.json exist for {}".format(self.name))
-        hashed_meta = self._get_meta_hash(str(settings_meta))
+
+        hashed_meta = self._get_meta_hash(settings_meta)
         skill_settings = self._request_other_settings(hashed_meta)
         # if hash is new then there is a diff version of settingsmeta
         if self._is_new_hash(hashed_meta):
@@ -143,9 +166,7 @@ class SkillSettings(dict):
             else:
                 settings = self._request_my_settings(hashed_meta)
                 if settings is None:
-                    LOG.info("seems like it got deleted from home... "
-                             "sending settingsmeta.json for "
-                             "{}".format(self.name))
+                    # metadata got deleted from Home, send up
                     self._upload_meta(settings_meta, hashed_meta)
                 else:
                     self.save_skill_settings(settings)
@@ -153,7 +174,7 @@ class SkillSettings(dict):
 
     @property
     def _is_stored(self):
-        return hash(str(self)) == self.loaded_hash
+        return hash(json.dumps(self, sort_keys=True)) == self.loaded_hash
 
     def __getitem__(self, key):
         """ Get key """
@@ -176,17 +197,15 @@ class SkillSettings(dict):
                 LOG.error(repr(e))
                 return None
         else:
-            LOG.info("settingemeta.json does not exist")
             return None
 
     def _send_settings_meta(self, settings_meta):
         """ Send settingsmeta.json to the server.
 
-            Args:
-                settings_meta (dict): dictionary of the current settings meta
-
-            Returns:
-                str: uuid, a unique id for the setting meta data
+        Args:
+            settings_meta (dict): dictionary of the current settings meta
+        Returns:
+            dict: uuid, a unique id for the setting meta data
         """
         try:
             uuid = self._put_metadata(settings_meta)
@@ -196,10 +215,10 @@ class SkillSettings(dict):
             return None
 
     def save_skill_settings(self, skill_settings):
-        """ takes skill object and save onto self
+        """ Takes skill object and save onto self
 
-            Args:
-                settings (dict): skill
+        Args:
+            skill_settings (dict): skill
         """
         if self._is_new_hash(skill_settings['identifier']):
             self._save_uuid(skill_settings['uuid'])
@@ -207,15 +226,15 @@ class SkillSettings(dict):
         sections = skill_settings['skillMetadata']['sections']
         for section in sections:
             for field in section["fields"]:
-                if "name" in field:  # no name for 'label' fields
+                if "name" in field and "value" in field:
                     self[field['name']] = field['value']
         self.store()
 
     def _load_uuid(self):
         """ Loads uuid
 
-            Returns:
-                str: uuid of the previous settingsmeta
+        Returns:
+            str: uuid of the previous settingsmeta
         """
         directory = self.config.get("skills")["directory"]
         directory = join(directory, self.name)
@@ -230,10 +249,9 @@ class SkillSettings(dict):
     def _save_uuid(self, uuid):
         """ Saves uuid.
 
-            Args:
-                str: uuid, unique id of new settingsmeta
+        Args:
+            uuid (str): uuid, unique id of new settingsmeta
         """
-        LOG.info("saving uuid {}".format(str(uuid)))
         directory = self.config.get("skills")["directory"]
         directory = join(directory, self.name)
         directory = expanduser(directory)
@@ -244,8 +262,8 @@ class SkillSettings(dict):
     def _uuid_exist(self):
         """ Checks if there is an uuid file.
 
-            Returns:
-                bool: True if uuid file exist False otherwise
+        Returns:
+            bool: True if uuid file exist False otherwise
         """
         directory = self.config.get("skills")["directory"]
         directory = join(directory, self.name)
@@ -270,72 +288,58 @@ class SkillSettings(dict):
     def _upload_meta(self, settings_meta, hashed_meta):
         """ uploads the new meta data to settings with settings migration
 
-            Args:
-                settings_meta (dict): settingsmeta.json
-                hashed_meta (str): {skill-folder}-settinsmeta.json
+        Args:
+            settings_meta (dict): settingsmeta.json
+            hashed_meta (str): {skill-folder}-settinsmeta.json
         """
-        LOG.info("sending settingsmeta.json for {}".format(self.name) +
-                 " to servers")
         meta = self._migrate_settings(settings_meta)
         meta['identifier'] = str(hashed_meta)
         response = self._send_settings_meta(meta)
-        if response:
+        if response and 'uuid' in response:
             self._save_uuid(response['uuid'])
             if 'not_owner' in self:
                 del self['not_owner']
         self._save_hash(hashed_meta)
 
-    def _delete_old_meta(self):
-        """" Deletes the old meta data """
-        if self._uuid_exist():
-            try:
-                LOG.info("a uuid exist for {}".format(self.name) +
-                         " deleting old one")
-                old_uuid = self._load_uuid()
-                self._delete_metatdata(old_uuid)
-            except Exception as e:
-                LOG.info(e)
-
-    def hash(self, str):
+    def hash(self, string):
         """ md5 hasher for consistency across cpu architectures """
-        return hashlib.md5(str).hexdigest()
+        return hashlib.md5(bytes(string, 'utf-8')).hexdigest()
 
     def _get_meta_hash(self, settings_meta):
-        """ Get's the hash of skill
+        """ Gets the hash of skill
 
-            Args:
-                settings_meta (str): stringified settingsmeta
-
-            Returns:
-                _hash (str): hashed to identify skills
+        Args:
+            settings_meta (dict): settingsmeta object
+        Returns:
+            _hash (str): hashed to identify skills
         """
-        _hash = self.hash(str(settings_meta) + str(self._user_identity))
-        return "{}-{}".format(basename(self.directory), _hash)
+        _hash = self.hash(json.dumps(settings_meta, sort_keys=True) +
+                          self._user_identity)
+        return "{}--{}".format(self.name, _hash)
 
     def _save_hash(self, hashed_meta):
         """ Saves hashed_meta to settings directory.
 
-            Args:
-                hashed_meta (int): hash of new settingsmeta
+        Args:
+            hashed_meta (str): hash of new settingsmeta
         """
-        LOG.info("saving hash {}".format(str(hashed_meta)))
         directory = self.config.get("skills")["directory"]
         directory = join(directory, self.name)
         directory = expanduser(directory)
         hash_file = join(directory, 'hash')
         with open(hash_file, 'w') as f:
-            f.write(str(hashed_meta))
+            f.write(hashed_meta)
 
     def _is_new_hash(self, hashed_meta):
-        """ checks if the stored hash is the same as current.
-            if the hashed file does not exist, usually in the
-            case of first load, then the create it and return True
+        """ Check if stored hash is the same as current.
 
-            Args:
-                hashed_meta (int): hash of metadata and uuid of device
+        If the hashed file does not exist, usually in the
+        case of first load, then the create it and return True
 
-            Returns:
-                bool: True if hash is new, otherwise False
+        Args:
+            hashed_meta (str): hash of metadata and uuid of device
+        Returns:
+            bool: True if hash is new, otherwise False
         """
         directory = self.config.get("skills")["directory"]
         directory = join(directory, self.name)
@@ -358,7 +362,6 @@ class SkillSettings(dict):
             skills_settings = self._request_other_settings(hashed_meta)
         if not skills_settings:
             skills_settings = self._request_my_settings(hashed_meta)
-
         if skills_settings is not None:
             self.save_skill_settings(skills_settings)
             self.store()
@@ -370,27 +373,35 @@ class SkillSettings(dict):
         """ If identifier exists for this skill poll to backend to
             request settings and store it if it changes
             TODO: implement as websocket
-
-            Args:
-                hashed_meta (int): the hashed identifier
         """
+        original = hash(str(self))
         try:
-            if not self._complete_intialization:
+            if not is_paired():
+                pass
+            elif not self._complete_intialization:
                 self.initialize_remote_settings()
                 if not self._complete_intialization:
                     return  # unable to do remote sync
             else:
                 self.update_remote()
-        except Exception as e:
-            LOG.error(e)
-            LOG.exception("")
 
-        # this is used in core so do not delete!
-        if self.is_alive:
-            # continues to poll settings every 60 seconds
-            t = Timer(60, self._poll_skill_settings)
-            t.daemon = True
-            t.start()
+        except Exception as e:
+            LOG.exception('Failed to fetch skill settings: {}'.format(repr(e)))
+        finally:
+            # Call callback for updated settings
+            if self.changed_callback and hash(str(self)) != original:
+                self.changed_callback()
+
+        if self._poll_timer:
+            self._poll_timer.cancel()
+
+        if not self._is_alive:
+            return
+
+        # continues to poll settings every minute
+        self._poll_timer = Timer(60, self._poll_skill_settings)
+        self._poll_timer.daemon = True
+        self._poll_timer.start()
 
     def load_skill_settings_from_file(self):
         """ If settings.json exist, open and read stored values into self """
@@ -405,22 +416,74 @@ class SkillSettings(dict):
                     # metadata to be able to edit later.
                     LOG.error(e)
 
+    def _type_cast(self, settings_meta, to_platform):
+        """ Tranform data type to be compatible with Home and/or Core.
+
+        e.g.
+        Web to core
+        "true" => True, "1.4" =>  1.4
+
+        core to Web
+        False => "false'
+
+        Args:
+            settings_meta (dict): skills object
+            to_platform (str): platform to convert
+                               compatible data types to
+        Returns:
+            dict: skills object
+        """
+        meta = settings_meta.copy()
+        sections = meta['skillMetadata']['sections']
+
+        for i, section in enumerate(sections):
+            for j, field in enumerate(section.get('fields', [])):
+                _type = field.get('type')
+                if _type == 'checkbox':
+                    value = field.get('value')
+
+                    if to_platform == 'web':
+                        if value is True or value == 'True':
+                            sections[i]['fields'][j]['value'] = 'true'
+                        elif value is False or value == 'False':
+                            sections[i]['fields'][j]['value'] = 'false'
+
+                    elif to_platform == 'core':
+                        if value == 'true' or value == 'True':
+                            sections[i]['fields'][j]['value'] = True
+                        elif value == 'false' or value == 'False':
+                            sections[i]['fields'][j]['value'] = False
+
+                elif _type == 'number':
+                    value = field.get('value')
+
+                    if to_platform == 'core':
+                        if "." in value:
+                            sections[i]['fields'][j]['value'] = float(value)
+                        else:
+                            sections[i]['fields'][j]['value'] = int(value)
+
+                    elif to_platform == 'web':
+                        sections[i]['fields'][j]['value'] = str(value)
+
+        meta['skillMetadata']['sections'] = sections
+        return meta
+
     def _request_my_settings(self, identifier):
         """ Get skill settings for this device associated
             with the identifier
 
-            Args:
-                identifier (str): a hashed_meta
-
-            Returns:
-                skill_settings (dict or None): returns a dict if matches
+        Args:
+            identifier (str): a hashed_meta
+        Returns:
+            skill_settings (dict or None): returns a dict if matches
         """
-        LOG.info("getting skill settings from "
-                 "server for {}".format(self.name))
         settings = self._request_settings()
         # this loads the settings into memory for use in self.store
         for skill_settings in settings:
             if skill_settings['identifier'] == identifier:
+                skill_settings = \
+                    self._type_cast(skill_settings, to_platform='core')
                 self._remote_settings = skill_settings
                 return skill_settings
         return None
@@ -428,8 +491,8 @@ class SkillSettings(dict):
     def _request_settings(self):
         """ Get all skill settings for this device from server.
 
-            Returns:
-                dict: dictionary with settings collected from the server.
+        Returns:
+            dict: dictionary with settings collected from the server.
         """
         settings = self.api.request({
             "method": "GET",
@@ -439,18 +502,13 @@ class SkillSettings(dict):
         return settings
 
     def _request_other_settings(self, identifier):
-        """ Retrieves user skill from other devices by identifier (hashed_meta)
+        """ Retrieve user skill from other devices by identifier (hashed_meta)
 
         Args:
-            indentifier (str): identifier for this skill
-
+            identifier (str): identifier for this skill
         Returns:
             settings (dict or None): returns the settings if true else None
         """
-        LOG.info(
-            "syncing settings with other devices "
-            "from server for {}".format(self.name))
-
         path = \
             "/" + self._device_identity + "/userSkill?identifier=" + identifier
         user_skill = self.api.request({
@@ -460,16 +518,17 @@ class SkillSettings(dict):
         if len(user_skill) == 0:
             return None
         else:
-            return user_skill[0]
+            settings = self._type_cast(user_skill[0], to_platform='core')
+            return settings
 
     def _put_metadata(self, settings_meta):
         """ PUT settingsmeta to backend to be configured in server.
             used in place of POST and PATCH.
 
-            Args:
-                settings_meta (dict): dictionary of the current settings meta
-                                      data
+        Args:
+            settings_meta (dict): dictionary of the current settings meta data
         """
+        settings_meta = self._type_cast(settings_meta, to_platform='web')
         return self.api.request({
             "method": "PUT",
             "path": self._api_path,
@@ -477,20 +536,20 @@ class SkillSettings(dict):
         })
 
     def _delete_metadata(self, uuid):
-        """ Deletes the current skill metadata
+        """ Delete the current skill metadata
 
-            Args:
-                uuid (str): unique id of the skill
+        Args:
+            uuid (str): unique id of the skill
         """
         try:
-            LOG.info("deleting metadata")
+            LOG.debug("deleting metadata")
             self.api.request({
                 "method": "DELETE",
                 "path": self._api_path + "/{}".format(uuid)
             })
         except Exception as e:
             LOG.error(e)
-            LOG.info(
+            LOG.error(
                 "cannot delete metadata because this"
                 "device is not original uploader of skill")
 
@@ -502,7 +561,10 @@ class SkillSettings(dict):
             for i, section in enumerate(sections):
                 for j, field in enumerate(section['fields']):
                     if 'name' in field:
-                        if field["name"] in self:
+                        # Ensure that the field exists in settings and that
+                        # it has a value to compare
+                        if (field["name"] in self and
+                                'value' in sections[i]['fields'][j]):
                             remote_val = sections[i]['fields'][j]["value"]
                             self_val = self.get(field['name'])
                             if str(remote_val) != str(self_val):
@@ -514,20 +576,18 @@ class SkillSettings(dict):
     def store(self, force=False):
         """ Store dictionary to file if a change has occured.
 
-            Args:
-                force:  Force write despite no change
+        Args:
+            force:  Force write despite no change
         """
-
         if force or not self._is_stored:
             with open(self._settings_path, 'w') as f:
                 json.dump(self, f)
-            self.loaded_hash = hash(str(self))
+            self.loaded_hash = hash(json.dumps(self, sort_keys=True))
 
         if self._should_upload_from_change:
             settings_meta = self._load_settings_meta()
             hashed_meta = self._get_meta_hash(settings_meta)
             uuid = self._load_uuid()
             if uuid is not None:
-                LOG.info("deleting meta data for {}".format(self.name))
                 self._delete_metadata(uuid)
             self._upload_meta(settings_meta, hashed_meta)

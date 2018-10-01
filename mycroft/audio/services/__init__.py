@@ -21,13 +21,13 @@ class AudioBackend():
 
         Args:
             config: configuration dict for the instance
-            emitter: eventemitter or websocket object
+            bus:    mycroft messagebus emitter
     """
     __metaclass__ = ABCMeta
 
-    @abstractmethod
-    def __init__(self, config, emitter):
-        pass
+    def __init__(self, config, bus):
+        self._track_start_callback = None
+        self.supports_mime_hints = False
 
     @abstractmethod
     def supported_uris(self):
@@ -54,9 +54,12 @@ class AudioBackend():
         pass
 
     @abstractmethod
-    def play(self):
+    def play(self, repeat=False):
         """
             Start playback.
+
+            Args:
+                repeat: Repeat playlist, defaults to False
         """
         pass
 
@@ -64,8 +67,17 @@ class AudioBackend():
     def stop(self):
         """
             Stop playback.
+
+            Returns: (bool) True if playback was stopped, otherwise False
         """
         pass
+
+    def set_track_start_callback(self, callback_func):
+        """
+            Register callback on track start, should be called as each track
+            in a playlist is started.
+        """
+        self._track_start_callback = callback_func
 
     def pause(self):
         """
@@ -114,3 +126,7 @@ class AudioBackend():
         ret['artist'] = ''
         ret['album'] = ''
         return ret
+
+    def shutdown(self):
+        """ perform clean shutdown """
+        self.stop()

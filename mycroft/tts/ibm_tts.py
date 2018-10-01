@@ -1,34 +1,45 @@
-from mycroft.tts import TTS, TTSValidator
-from os.path import join, dirname
-from watson_developer_cloud import TextToSpeechV1
-from threading import Thread
-from time import sleep
-from mycroft.tts import mimic_tts
+# Copyright 2017 Mycroft AI Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from mycroft.tts import TTSValidator
+from mycroft.tts.remote_tts import RemoteTTS
+from mycroft.configuration import Configuration
+from requests.auth import HTTPBasicAuth
 
 
-class IBMTTS(TTS):
-    def __init__(self, lang, voice, username, password, timeout):
-        self.type = 'mp3'
-        super(IBMTTS, self).__init__(lang, voice, IBMTTSValidator(self))
-        self.text_to_speech = TextToSpeechV1(
-            username=username,
-            password=password)
+class WatsonTTS(RemoteTTS):
+    PARAMS = {'accept': 'audio/wav'}
 
-    def get_tts(self, sentence, wav_file):
-        try:
-            result = self.text_to_speech.synthesize(sentence, \
-              accept="audio/mp3", voice=self.voice)
+    def __init__(self, lang, config,
+                 url="https://stream.watsonplatform.net/text-to-speech/api"):
+        super(WatsonTTS, self).__init__(lang, config, url, '/v1/synthesize',
+                                        WatsonTTSValidator(self))
+        self.type = "wav"
+        user = self.config.get("user") or self.config.get("username")
+        password = self.config.get("password")
+        self.auth = HTTPBasicAuth(user, password)
 
-	    with open(wav_file, 'wb') as audio_file:
-	        audio_file.write(result) 
+    def build_request_params(self, sentence):
+        params = self.PARAMS.copy()
+        params['LOCALE'] = self.lang
+        params['voice'] = self.voice
+        params['text'] = sentence.encode('utf-8')
+        return params
 
-            return (wav_file, None)
 
-        except Exception as e:
-            print e
-            print "IBM TTS ran into an error."
-
-class IBMTTSValidator(TTSValidator):
+class WatsonTTSValidator(TTSValidator):
     def __init__(self, tts):
         super(IBMTTSValidator, self).__init__(tts)
 

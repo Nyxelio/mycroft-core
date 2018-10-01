@@ -14,23 +14,33 @@
 #
 from copy import copy
 
+import json
 import requests
-from requests import HTTPError
+from requests import HTTPError, RequestException
 
 from mycroft.configuration import Configuration
 from mycroft.configuration.config import DEFAULT_CONFIG, SYSTEM_CONFIG, \
     USER_CONFIG
-from mycroft.identity import IdentityManager
+from mycroft.identity import IdentityManager, identity_lock
 from mycroft.version import VersionManager
-from mycroft.util import get_arch
-# python 2/3 compatibility
-from future.utils import iteritems
+from mycroft.util import get_arch, connected, LOG
+
 
 _paired_cache = False
 
 
+class BackendDown(RequestException):
+    pass
+
+
+class InternetDown(RequestException):
+    pass
+
+
 class Api(object):
     """ Generic object to wrap web APIs """
+    params_to_etag = {}
+    etag_to_response = {}
 
     def __init__(self, path):
         self.path = path
@@ -53,39 +63,98 @@ class Api(object):
         return self.send(params)
 
     def check_token(self):
+        # If the identity hasn't been loaded, load it
+        if not self.identity.has_refresh():
+            self.identity = IdentityManager.load()
+        # If refresh is needed perform a refresh
         if self.identity.refresh and self.identity.is_expired():
             self.identity = IdentityManager.load()
+            # if no one else has updated the token refresh it
             if self.identity.is_expired():
                 self.refresh_token()
 
     def refresh_token(self):
-        data = self.send({
-            "path": "auth/token",
-            "headers": {
-                "Authorization": "Bearer " + self.identity.refresh
-            }
-        })
-        IdentityManager.save(data)
+        LOG.debug('Refreshing token')
+        if identity_lock.acquire(blocking=False):
+            try:
+                data = self.send({
+                    "path": "auth/token",
+                    "headers": {
+                        "Authorization": "Bearer " + self.identity.refresh
+                    }
+                })
+                IdentityManager.save(data, lock=False)
+                LOG.debug('Saved credentials')
+            finally:
+                identity_lock.release()
+        else:  # Someone is updating the identity wait for release
+            LOG.debug('Refresh is already in progress, waiting until done')
+            self.identity = IdentityManager.load()
+            LOG.debug('new credentials loaded')
 
-    def send(self, params):
+    def send(self, params, no_refresh=False):
+        """ Send request to mycroft backend.
+        The method handles Etags and will return a cached response value
+        if nothing has changed on the remote.
+
+        Arguments:
+            params (dict): request parameters
+            no_refresh (bool): optional parameter to disable refreshs of token
+
+        Returns:
+            Requests response object.
+        """
+        query_data = frozenset(params.get('query', {}).items())
+        params_key = (params.get('path'), query_data)
+        etag = self.params_to_etag.get(params_key)
+
         method = params.get("method", "GET")
         headers = self.build_headers(params)
         data = self.build_data(params)
-        json = self.build_json(params)
+        json_body = self.build_json(params)
         query = self.build_query(params)
         url = self.build_url(params)
-        response = requests.request(method, url, headers=headers, params=query,
-                                    data=data, json=json, timeout=(3.05, 15))
-        return self.get_response(response)
 
-    def get_response(self, response):
+        # For an introduction to the Etag feature check out:
+        # https://en.wikipedia.org/wiki/HTTP_ETag
+        if etag:
+            headers['If-None-Match'] = etag
+
+        response = requests.request(
+            method, url, headers=headers, params=query,
+            data=data, json=json_body, timeout=(3.05, 15)
+        )
+        if response.status_code == 304:
+            # Etag matched, use response previously cached
+            response = self.etag_to_response[etag]
+        elif 'ETag' in response.headers:
+            etag = response.headers['ETag'].strip('"')
+            # Cache response for future lookup when we receive a 304
+            self.params_to_etag[params_key] = etag
+            self.etag_to_response[etag] = response
+
+        return self.get_response(response, no_refresh)
+
+    def get_response(self, response, no_refresh=False):
+        """ Parse response and extract data from response.
+
+        Will try to refresh the access token if it's expired.
+
+        Arguments:
+            response (requests Response object): Response to parse
+            no_refresh (bool): Disable refreshing of the token
+        Returns:
+            data fetched from server
+        """
         data = self.get_data(response)
+
         if 200 <= response.status_code < 300:
             return data
-        elif response.status_code == 401 \
-                and not response.url.endswith("auth/token"):
+        elif (not no_refresh and response.status_code == 401 and not
+                response.url.endswith("auth/token") and
+                self.identity.is_expired()):
             self.refresh_token()
-            return self.send(self.old_params)
+            return self.send(self.old_params, no_refresh=True)
         raise HTTPError(data, response=response)
 
     def get_data(self, response):
@@ -115,7 +184,7 @@ class Api(object):
     def build_json(self, params):
         json = params.get("json")
         if json and params["headers"]["Content-Type"] == "application/json":
-            for k, v in iteritems(json):
+            for k, v in json.items():
                 if v == "":
                     json[k] = None
             params["json"] = json
@@ -263,21 +332,6 @@ class DeviceApi(Api):
             path = '/' + self.identity.uuid + '/voice?arch=' + arch
             return self.request({'path': path})['link']
 
-    def find(self):
-        """ Deprecated, see get_location() """
-        # TODO: Eliminate ASAP, for backwards compatibility only
-        return self.get()
-
-    def find_setting(self):
-        """ Deprecated, see get_settings() """
-        # TODO: Eliminate ASAP, for backwards compatibility only
-        return self.get_settings()
-
-    def find_location(self):
-        """ Deprecated, see get_location() """
-        # TODO: Eliminate ASAP, for backwards compatibility only
-        return self.get_location()
-
     def get_oauth_token(self, dev_cred):
         """
             Get Oauth token for dev_credential dev_cred.
@@ -297,8 +351,8 @@ class DeviceApi(Api):
 class STTApi(Api):
     """ Web API wrapper for performing Speech to Text (STT) """
 
-    def __init__(self):
-        super(STTApi, self).__init__("stt")
+    def __init__(self, path):
+        super(STTApi, self).__init__(path)
 
     def stt(self, audio, language, limit):
         """ Web API wrapper for performing Speech to Text (STT)
@@ -332,7 +386,7 @@ def has_been_paired():
     return id.uuid is not None and id.uuid != ""
 
 
-def is_paired():
+def is_paired(ignore_errors=True):
     """ Determine if this device is actively paired with a web backend
 
     Determines if the installation of Mycroft has been paired by the user
@@ -354,5 +408,13 @@ def is_paired():
         _paired_cache = api.identity.uuid is not None and \
             api.identity.uuid != ""
         return _paired_cache
-    except:
+    except HTTPError as e:
+        if e.response.status_code == 401:
+            return False
+    except Exception as e:
+        LOG.warning('Could not get device infO: ' + repr(e))
+    if ignore_errors:
         return False
+    if connected():
+        raise BackendDown
+    raise InternetDown

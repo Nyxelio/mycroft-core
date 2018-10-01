@@ -21,14 +21,19 @@ import mycroft.api
 import mycroft.configuration
 from mycroft.util.log import LOG
 
-CONFIG = {
-    'server': {
-        'url': 'https://api-test.mycroft.ai',
-        'version': 'v1',
-        'update': True,
-        'metrics': False
+from test.util import base_config
+CONFIG = base_config()
+CONFIG.merge(
+    {
+        'data_dir': '/opt/mycroft',
+        'server': {
+            'url': 'https://api-test.mycroft.ai',
+            'version': 'v1',
+            'update': True,
+            'metrics': False
         }
     }
+)
 
 
 mycroft.api.requests.post = mock.MagicMock()
@@ -268,7 +273,7 @@ class TestApi(unittest.TestCase):
         mock_identity = mock.MagicMock()
         mock_identity.uuid = '1234'
         mock_identity_get.return_value = mock_identity
-        stt = mycroft.api.STTApi()
+        stt = mycroft.api.STTApi('stt')
         self.assertEquals(stt.path, 'stt')
 
     @mock.patch('mycroft.api.IdentityManager.get')
@@ -278,7 +283,7 @@ class TestApi(unittest.TestCase):
         mock_identity = mock.MagicMock()
         mock_identity.uuid = '1234'
         mock_identity_get.return_value = mock_identity
-        stt = mycroft.api.STTApi()
+        stt = mycroft.api.STTApi('stt')
         stt.stt('La la la', 'en-US', 1)
         url = mock_request.call_args[0][1]
         self.assertEquals(url, 'https://api-test.mycroft.ai/v1/stt')

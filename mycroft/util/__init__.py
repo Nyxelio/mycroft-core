@@ -12,21 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from __future__ import absolute_import
+import re
 import socket
 import subprocess
+from os.path import join, expanduser
 
+from threading import Thread
+from time import sleep
+
+import json
 import os.path
 import psutil
 from stat import S_ISREG, ST_MTIME, ST_MODE, ST_SIZE
+import requests
+
+import signal as sig
 
 import mycroft.audio
 import mycroft.configuration
-from mycroft.util.format import nice_number, convert_number
+from mycroft.util.format import nice_number
 # Officially exported methods from this file:
-# play_wav, play_mp3, get_cache_directory,
+# play_wav, play_mp3, play_ogg, get_cache_directory,
 # resolve_resource_file, wait_while_speaking
 from mycroft.util.log import LOG
-from mycroft.util.parse import extract_datetime, extractnumber, normalize
+from mycroft.util.parse import extract_datetime, extract_number, normalize
 from mycroft.util.signal import *
 
 
@@ -52,6 +62,7 @@ def resolve_resource_file(res_name):
     Args:
         res_name (str): a resource path/name
     """
+    config = mycroft.configuration.Configuration.get()
 
     # First look for fully qualified file (e.g. a user setting)
     if os.path.isfile(res_name):
@@ -63,7 +74,8 @@ def resolve_resource_file(res_name):
         return filename
 
     # Next look for /opt/mycroft/res/res_name
-    filename = os.path.expanduser("/opt/mycroft/" + res_name)
+    data_dir = expanduser(config['data_dir'])
+    filename = os.path.expanduser(join(data_dir, res_name))
     if os.path.isfile(filename):
         return filename
 
@@ -94,6 +106,16 @@ def play_mp3(uri):
         if cmd == "%1":
             play_mp3_cmd[index] = (get_http(uri))
     return subprocess.Popen(play_mp3_cmd)
+
+
+def play_ogg(uri):
+    config = mycroft.configuration.Configuration.get()
+    play_cmd = config.get("play_ogg_cmdline")
+    play_ogg_cmd = str(play_cmd).split(" ")
+    for index, cmd in enumerate(play_ogg_cmd):
+        if cmd == "%1":
+            play_ogg_cmd[index] = (get_http(uri))
+    return subprocess.Popen(play_ogg_cmd)
 
 
 def record(file_path, duration, rate, channels):
@@ -130,26 +152,51 @@ def read_dict(filename, div='='):
     return d
 
 
-def connected(host="8.8.8.8", port=53, timeout=3):
-    """
-    Thanks to 7h3rAm on
-    Host: 8.8.8.8 (google-public-dns-a.google.com)
-    OpenPort: 53/tcp
-    Service: domain (DNS/TCP)
+def connected():
+    """ Check connection by connecting to 8.8.8.8, if this is
+    blocked/fails, Microsoft NCSI is used as a backup
 
-    NOTE:
-    This is no longer in use by this version
-    New method checks for a connection using ConnectionError only when
-    a question is asked
+    Returns:
+        True if internet connection can be detected
+    """
+    return connected_dns() or connected_ncsi()
+
+
+def connected_ncsi():
+    """ Check internet connection by retrieving the Microsoft NCSI endpoint.
+
+    Returns:
+        True if internet connection can be detected
     """
     try:
-        socket.setdefaulttimeout(timeout)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+        r = requests.get('http://www.msftncsi.com/ncsi.txt')
+        if r.text == u'Microsoft NCSI':
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def connected_dns(host="8.8.8.8", port=53, timeout=3):
+    """ Check internet connection by connecting to DNS servers
+
+    Returns:
+        True if internet connection can be detected
+    """
+    # Thanks to 7h3rAm on
+    # Host: 8.8.8.8 (google-public-dns-a.google.com)
+    # OpenPort: 53/tcp
+    # Service: domain (DNS/TCP)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
         return True
     except IOError:
         try:
-            socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(
-                ("8.8.4.4", port))
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect(("8.8.4.4", port))
             return True
         except IOError:
             return False
@@ -266,3 +313,60 @@ def stop_speaking():
 def get_arch():
     """ Get architecture string of system. """
     return os.uname()[4]
+
+
+def reset_sigint_handler():
+    """
+    Reset the sigint handler to the default. This fixes KeyboardInterrupt
+    not getting raised when started via start-mycroft.sh
+    """
+    sig.signal(sig.SIGINT, sig.default_int_handler)
+
+
+def create_daemon(target, args=(), kwargs=None):
+    """Helper to quickly create and start a thread with daemon = True"""
+    t = Thread(target=target, args=args, kwargs=kwargs)
+    t.daemon = True
+    t.start()
+    return t
+
+
+def wait_for_exit_signal():
+    """Blocks until KeyboardInterrupt is received"""
+    try:
+        while True:
+            sleep(100)
+    except KeyboardInterrupt:
+        pass
+
+
+def create_echo_function(name, whitelist=None):
+    from mycroft.configuration import Configuration
+    blacklist = Configuration.get().get("ignore_logs")
+
+    def echo(message):
+        """Listen for messages and echo them for logging"""
+        try:
+            js_msg = json.loads(message)
+
+            if whitelist and js_msg.get("type") not in whitelist:
+                return
+
+            if blacklist and js_msg.get("type") in blacklist:
+                return
+
+            if js_msg.get("type") == "registration":
+                # do not log tokens from registration messages
+                js_msg["data"]["token"] = None
+                message = json.dumps(js_msg)
+        except Exception:
+            pass
+        LOG(name).debug(message)
+    return echo
+
+
+def camel_case_split(identifier: str) -> str:
+    """Split camel case string"""
+    regex = '.+?(?:(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|$)'
+    matches = re.finditer(regex, identifier)
+    return ' '.join([m.group(0) for m in matches])

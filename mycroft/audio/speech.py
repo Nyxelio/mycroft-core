@@ -12,17 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import time
 import re
-
+import time
 from threading import Lock
+
 from mycroft.configuration import Configuration
+from mycroft.metrics import report_timing, Stopwatch
 from mycroft.tts import TTSFactory
 from mycroft.util import create_signal, check_for_signal
 from mycroft.util.log import LOG
-from mycroft.metrics import report_timing, Stopwatch
+from mycroft.messagebus.message import Message
 
-ws = None  # TODO:18.02 - Rename to "messagebus"
+bus = None  # Mycroft messagebus connection
 config = None
 tts = None
 tts_hash = None
@@ -43,7 +44,7 @@ def handle_speak(event):
         Handle "speak" message
     """
     config = Configuration.get()
-    Configuration.init(ws)
+    Configuration.init(bus)
     global _last_stop_signal
 
     # Get conversation ID
@@ -59,7 +60,7 @@ def handle_speak(event):
         if event.data.get('expect_response', False):
             # When expect_response is requested, the listener will be restarted
             # at the end of the next bit of spoken audio.
-            ws.once('recognizer_loop:audio_output_end', _start_listener)
+            bus.once('recognizer_loop:audio_output_end', _start_listener)
 
         # This is a bit of a hack for Picroft.  The analog audio on a Pi blocks
         # for 30 seconds fairly often, so we don't want to break on periods
@@ -69,7 +70,8 @@ def handle_speak(event):
         #
         # TODO: Remove or make an option?  This is really a hack, anyway,
         # so we likely will want to get rid of this when not running on Mimic
-        if not config.get('enclosure', {}).get('platform') == "picroft":
+        if (config.get('enclosure', {}).get('platform') != "picroft" and
+                len(re.findall('<[^>]*>', utterance)) == 0):
             start = time.time()
             chunks = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s',
                               utterance)
@@ -87,7 +89,8 @@ def handle_speak(event):
             mute_and_speak(utterance, ident)
 
         stopwatch.stop()
-    report_timing(ident, 'speech', stopwatch, {'utterance': utterance})
+    report_timing(ident, 'speech', stopwatch, {'utterance': utterance,
+                                               'tts': tts.__class__.__name__})
 
 
 def mute_and_speak(utterance, ident):
@@ -108,11 +111,14 @@ def mute_and_speak(utterance, ident):
         tts.playback.join()
         # Create new tts instance
         tts = TTSFactory.create()
-        tts.init(ws)
+        tts.init(bus)
         tts_hash = hash(str(config.get('tts', '')))
 
     LOG.info("Speak: " + utterance)
-    tts.execute(utterance, ident)
+    try:
+        tts.execute(utterance, ident)
+    except Exception as e:
+        LOG.error('TTS execution failed ({})'.format(repr(e)))
 
 
 def handle_stop(event):
@@ -124,33 +130,35 @@ def handle_stop(event):
         _last_stop_signal = time.time()
         tts.playback.clear_queue()
         tts.playback.clear_visimes()
+        bus.emit(Message("mycroft.stop.handled", {"by": "TTS"}))
 
 
-def init(websocket):
+def init(messagebus):
+    """ Start speech related handlers.
+
+    Arguments:
+        messagebus: Connection to the Mycroft messagebus
     """
-        Start speach related handlers
-    """
 
-    global ws
+    global bus
     global tts
     global tts_hash
     global config
 
-    ws = websocket
-    Configuration.init(ws)
+    bus = messagebus
+    Configuration.init(bus)
     config = Configuration.get()
-    ws.on('mycroft.stop', handle_stop)
-    ws.on('mycroft.audio.speech.stop', handle_stop)
-    ws.on('speak', handle_speak)
-    ws.on('mycroft.mic.listen', _start_listener)
+    bus.on('mycroft.stop', handle_stop)
+    bus.on('mycroft.audio.speech.stop', handle_stop)
+    bus.on('speak', handle_speak)
+    bus.on('mycroft.mic.listen', _start_listener)
 
     tts = TTSFactory.create()
-    tts.init(ws)
+    tts.init(bus)
     tts_hash = config.get('tts')
 
 
 def shutdown():
-    global tts
     if tts:
         tts.playback.stop()
         tts.playback.join()

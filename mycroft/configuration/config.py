@@ -18,14 +18,10 @@ import re
 import json
 import inflection
 from os.path import exists, isfile, join, dirname, expanduser
-from requests import HTTPError
+from requests import RequestException
 
 from mycroft.util.json_helper import load_commented_json
 from mycroft.util.log import LOG
-
-# Python 2+3 compatibility
-from future.utils import iteritems
-from past.builtins import basestring
 
 
 def merge_dict(base, delta):
@@ -37,12 +33,23 @@ def merge_dict(base, delta):
             delta: Dictionary to merge into base
     """
 
-    for k, dv in iteritems(delta):
+    for k, dv in delta.items():
         bv = base.get(k)
         if isinstance(dv, dict) and isinstance(bv, dict):
             merge_dict(bv, dv)
         else:
             base[k] = dv
+
+
+def is_remote_list(values):
+    ''' check if this list corresponds to a backend formatted collection of
+    dictionaries '''
+    for v in values:
+        if not isinstance(v, dict):
+            return False
+        if "@type" not in v.keys():
+            return False
+    return True
 
 
 def translate_remote(config, setting):
@@ -56,7 +63,7 @@ def translate_remote(config, setting):
     """
     IGNORED_SETTINGS = ["uuid", "@type", "active", "user", "device"]
 
-    for k, v in iteritems(setting):
+    for k, v in setting.items():
         if k not in IGNORED_SETTINGS:
             # Translate the CamelCase values stored remotely into the
             # Python-style names used within mycroft-core.
@@ -65,9 +72,12 @@ def translate_remote(config, setting):
                 config[key] = config.get(key, {})
                 translate_remote(config[key], v)
             elif isinstance(v, list):
-                if key not in config:
-                    config[key] = {}
-                translate_list(config[key], v)
+                if is_remote_list(v):
+                    if key not in config:
+                        config[key] = {}
+                    translate_list(config[key], v)
+                else:
+                    config[key] = v
             else:
                 config[key] = v
 
@@ -139,14 +149,26 @@ class RemoteConf(LocalConf):
     def __init__(self, cache=None):
         super(RemoteConf, self).__init__(None)
 
-        cache = cache or '/opt/mycroft/web_config_cache.json'
+        cache = cache or '/var/tmp/mycroft_web_cache.json'
+        from mycroft.api import is_paired
+        if not is_paired():
+            self.load_local(cache)
+            return
 
         try:
             # Here to avoid cyclic import
             from mycroft.api import DeviceApi
             api = DeviceApi()
             setting = api.get_settings()
-            location = api.get_location()
+
+            try:
+                location = api.get_location()
+            except RequestException as e:
+                LOG.error("RequestException fetching remote location: {}"
+                          .format(str(e)))
+                if exists(cache) and isfile(cache):
+                    location = load_commented_json(cache).get('location')
+
             if location:
                 setting["location"] = location
             # Remove server specific entries
@@ -156,9 +178,9 @@ class RemoteConf(LocalConf):
                 self.__setitem__(key, config[key])
             self.store(cache)
 
-        except HTTPError as e:
-            LOG.error("HTTPError fetching remote configuration: %s" %
-                      e.response.status_code)
+        except RequestException as e:
+            LOG.error("RequestException fetching remote configuration: {}"
+                      .format(str(e)))
             self.load_local(cache)
 
         except Exception as e:
@@ -210,7 +232,7 @@ class Configuration(object):
         else:
             # Handle strings in stack
             for index, item in enumerate(configs):
-                if isinstance(item, basestring):
+                if isinstance(item, str):
                     configs[index] = LocalConf(item)
 
         # Merge all configs into one

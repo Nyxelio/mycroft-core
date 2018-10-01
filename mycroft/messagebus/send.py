@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Backport python 3 print function
-from __future__ import print_function
-
 import sys
 import json
 from mycroft.messagebus.client.ws import WebsocketClient
@@ -49,7 +46,7 @@ def main():
         print("Command line interface to the mycroft-core messagebus.")
         print("Usage: python -m mycroft.messagebus.send message")
         print("       python -m mycroft.messagebus.send message JSON-string\n")
-        print("Examples: python -m mycroft.messagebus.send mycroft.wifi.start")
+        print("Examples: python -m mycroft.messagebus.send system.wifi.setup")
         print("Ex: python -m mycroft.messagebus.send speak "
               "'{\"utterance\" : \"hello\"}'")
         exit()

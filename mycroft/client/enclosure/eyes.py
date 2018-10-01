@@ -20,23 +20,25 @@ class EnclosureEyes:
     Performs the associated command on Arduino by writing on the Serial port.
     """
 
-    def __init__(self, ws, writer):
-        self.ws = ws
+    def __init__(self, bus, writer):
+        self.bus = bus
         self.writer = writer
         self.__init_events()
 
     def __init_events(self):
-        self.ws.on('enclosure.eyes.on', self.on)
-        self.ws.on('enclosure.eyes.off', self.off)
-        self.ws.on('enclosure.eyes.blink', self.blink)
-        self.ws.on('enclosure.eyes.narrow', self.narrow)
-        self.ws.on('enclosure.eyes.look', self.look)
-        self.ws.on('enclosure.eyes.color', self.color)
-        self.ws.on('enclosure.eyes.level', self.brightness)
-        self.ws.on('enclosure.eyes.volume', self.volume)
-        self.ws.on('enclosure.eyes.spin', self.spin)
-        self.ws.on('enclosure.eyes.timedspin', self.timed_spin)
-        self.ws.on('enclosure.eyes.reset', self.reset)
+        self.bus.on('enclosure.eyes.on', self.on)
+        self.bus.on('enclosure.eyes.off', self.off)
+        self.bus.on('enclosure.eyes.blink', self.blink)
+        self.bus.on('enclosure.eyes.narrow', self.narrow)
+        self.bus.on('enclosure.eyes.look', self.look)
+        self.bus.on('enclosure.eyes.color', self.color)
+        self.bus.on('enclosure.eyes.level', self.brightness)
+        self.bus.on('enclosure.eyes.volume', self.volume)
+        self.bus.on('enclosure.eyes.spin', self.spin)
+        self.bus.on('enclosure.eyes.timedspin', self.timed_spin)
+        self.bus.on('enclosure.eyes.reset', self.reset)
+        self.bus.on('enclosure.eyes.setpixel', self.set_pixel)
+        self.bus.on('enclosure.eyes.fill', self.fill)
 
     def on(self, event=None):
         self.writer.write("eyes.on")
@@ -66,6 +68,24 @@ class EnclosureEyes:
             b = int(event.data.get("b", b))
         color = (r * 65536) + (g * 256) + b
         self.writer.write("eyes.color=" + str(color))
+
+    def set_pixel(self, event=None):
+        idx = 0
+        r, g, b = 255, 255, 255
+        if event and event.data:
+            idx = int(event.data.get("idx", idx))
+            r = int(event.data.get("r", r))
+            g = int(event.data.get("g", g))
+            b = int(event.data.get("b", b))
+        color = (r * 65536) + (g * 256) + b
+        self.writer.write("eyes.set=" + str(idx) + "," + str(color))
+
+    def fill(self, event=None):
+        amount = 0
+        if event and event.data:
+            percent = int(event.data.get("percentage", 0))
+            amount = int(round(23.0 * percent / 100.0))
+        self.writer.write("eyes.fill=" + str(amount))
 
     def brightness(self, event=None):
         level = 30

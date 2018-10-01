@@ -15,6 +15,7 @@
 import time
 from adapt.context import ContextManagerFrame
 from adapt.engine import IntentDeterminationEngine
+from adapt.intent import IntentBuilder
 
 from mycroft.configuration import Configuration
 from mycroft.messagebus.message import Message
@@ -22,9 +23,26 @@ from mycroft.skills.core import open_intent_envelope
 from mycroft.util.log import LOG
 from mycroft.util.parse import normalize
 from mycroft.metrics import report_timing, Stopwatch
-# python 2+3 compatibility
-from past.builtins import basestring
-from future.builtins import range
+from mycroft.skills.padatious_service import PadatiousService
+
+
+class AdaptIntent(IntentBuilder):
+    def __init__(self, name=''):
+        super().__init__(name)
+
+
+def workaround_one_of_context(best_intent):
+    """ Handle Adapt issue with context injection combined with one_of.
+
+    For all entries in the intent result where the value is None try to
+    populate using a value from the __tags__ structure.
+    """
+    for key in best_intent:
+        if best_intent[key] is None:
+            for t in best_intent['__tags__']:
+                if key in t:
+                    best_intent[key] = t[key][0]['entities'][0]['key']
+    return best_intent
 
 
 class ContextManager(object):
@@ -48,13 +66,12 @@ class ContextManager(object):
     def inject_context(self, entity, metadata=None):
         """
         Args:
-            entity(object):
-                format {'data': 'Entity tag as <str>',
-                        'key': 'entity proper name as <str>',
-                         'confidence': <float>'
-                         }
-            metadata(object): dict, arbitrary metadata about the entity being
-            added
+            entity(object): Format example...
+                               {'data': 'Entity tag as <str>',
+                                'key': 'entity proper name as <str>',
+                                'confidence': <float>'
+                               }
+            metadata(object): dict, arbitrary metadata about entity injected
         """
         metadata = metadata or {}
         try:
@@ -72,8 +89,7 @@ class ContextManager(object):
             pass
 
     def get_context(self, max_frames=None, missing_entities=None):
-        """
-        Constructs a list of entities from the context.
+        """ Constructs a list of entities from the context.
 
         Args:
             max_frames(int): maximum number of frames to look back
@@ -126,7 +142,7 @@ class ContextManager(object):
 
 
 class IntentService(object):
-    def __init__(self, emitter):
+    def __init__(self, bus):
         self.config = Configuration.get().get('context', {})
         self.engine = IntentDeterminationEngine()
 
@@ -138,26 +154,24 @@ class IntentService(object):
         self.context_timeout = self.config.get('timeout', 2)
         self.context_greedy = self.config.get('greedy', False)
         self.context_manager = ContextManager(self.context_timeout)
-        self.emitter = emitter
-        self.emitter.on('register_vocab', self.handle_register_vocab)
-        self.emitter.on('register_intent', self.handle_register_intent)
-        self.emitter.on('recognizer_loop:utterance', self.handle_utterance)
-        self.emitter.on('detach_intent', self.handle_detach_intent)
-        self.emitter.on('detach_skill', self.handle_detach_skill)
+        self.bus = bus
+        self.bus.on('register_vocab', self.handle_register_vocab)
+        self.bus.on('register_intent', self.handle_register_intent)
+        self.bus.on('recognizer_loop:utterance', self.handle_utterance)
+        self.bus.on('detach_intent', self.handle_detach_intent)
+        self.bus.on('detach_skill', self.handle_detach_skill)
         # Context related handlers
-        self.emitter.on('add_context', self.handle_add_context)
-        self.emitter.on('remove_context', self.handle_remove_context)
-        self.emitter.on('clear_context', self.handle_clear_context)
+        self.bus.on('add_context', self.handle_add_context)
+        self.bus.on('remove_context', self.handle_remove_context)
+        self.bus.on('clear_context', self.handle_clear_context)
         # Converse method
-        self.emitter.on('skill.converse.response',
-                        self.handle_converse_response)
-        self.emitter.on('mycroft.speech.recognition.unknown',
-                        self.reset_converse)
-        self.emitter.on('mycroft.skills.loaded', self.update_skill_name_dict)
+        self.bus.on('skill.converse.response', self.handle_converse_response)
+        self.bus.on('mycroft.speech.recognition.unknown', self.reset_converse)
+        self.bus.on('mycroft.skills.loaded', self.update_skill_name_dict)
 
         def add_active_skill_handler(message):
             self.add_active_skill(message.data['skill_id'])
-        self.emitter.on('active_skill_request', add_active_skill_handler)
+        self.bus.on('active_skill_request', add_active_skill_handler)
         self.active_skills = []  # [skill_id , timestamp]
         self.converse_timeout = 5  # minutes to prune active_skills
 
@@ -169,16 +183,15 @@ class IntentService(object):
         self.skill_names[message.data['id']] = message.data['name']
 
     def get_skill_name(self, skill_id):
-        """
-            Get skill name from skill ID.
+        """ Get skill name from skill ID.
 
-            Args
-                skill_id: a skill id as encoded in Intent handlers.
+        Args:
+            skill_id: a skill id as encoded in Intent handlers.
 
-            Returns: (str) Skill name or the skill id if the skill
-                     wasn't found in the dict.
+        Returns:
+            (str) Skill name or the skill id if the skill wasn't found
         """
-        return self.skill_names.get(int(skill_id), skill_id)
+        return self.skill_names.get(skill_id, skill_id)
 
     def reset_converse(self, message):
         """Let skills know there was a problem with speech recognition"""
@@ -187,10 +200,10 @@ class IntentService(object):
             self.do_converse(None, skill[0], lang)
 
     def do_converse(self, utterances, skill_id, lang):
-        self.emitter.emit(Message("skill.converse.request", {
-            "skill_id": skill_id, "utterances": utterances, "lang": lang}))
         self.waiting = True
         self.result = False
+        self.bus.emit(Message("skill.converse.request", {
+            "skill_id": skill_id, "utterances": utterances, "lang": lang}))
         start_time = time.time()
         t = 0
         while self.waiting and t < 5:
@@ -220,15 +233,14 @@ class IntentService(object):
         self.active_skills.insert(0, [skill_id, time.time()])
 
     def update_context(self, intent):
-        """
-            updates context with keyword from the intent.
+        """ Updates context with keyword from the intent.
 
-            NOTE: This method currently won't handle one_of intent keywords
-                  since it's not using quite the same format as other intent
-                  keywords. This is under investigation in adapt, PR pending.
+        NOTE: This method currently won't handle one_of intent keywords
+              since it's not using quite the same format as other intent
+              keywords. This is under investigation in adapt, PR pending.
 
-            Args:
-                intent: Intent to scan for keywords
+        Args:
+            intent: Intent to scan for keywords
         """
         for tag in intent['__tags__']:
             if 'entities' not in tag:
@@ -241,9 +253,10 @@ class IntentService(object):
 
     def send_metrics(self, intent, context, stopwatch):
         """
-            Send timing metrics to the backend.
+        Send timing metrics to the backend.
+
+        NOTE: This only applies to those with Opt In.
         """
-        LOG.debug('Sending metric')
         ident = context['ident'] if context else None
         if intent:
             # Recreate skill name from skill id
@@ -258,8 +271,20 @@ class IntentService(object):
                           {'intent_type': 'intent_failure'})
 
     def handle_utterance(self, message):
-        """
-            Messagebus handler for the recognizer_loop:utterance message
+        """ Main entrypoint for handling user utterances with Mycroft skills
+
+        Monitor the messagebus for 'recognizer_loop:utterance', typically
+        generated by a spoken interaction but potentially also from a CLI
+        or other method of injecting a 'user utterance' into the system.
+
+        Utterances then work through this sequence to be handled:
+        1) Active skills attempt to handle using converse()
+        2) Adapt intent handlers
+        3) Padatious intent handlers
+        4) Other fallbacks
+
+        Args:
+            message (Message): The messagebus data
         """
         try:
             # Get language of the utterance
@@ -268,11 +293,14 @@ class IntentService(object):
 
             stopwatch = Stopwatch()
             with stopwatch:
-                # Parse the sentence
-                converse = self.parse_converse(utterances, lang)
+                # Give active skills an opportunity to handle the utterance
+                converse = self._converse(utterances, lang)
+
                 if not converse:
-                    # no skill wants to handle utterance
-                    intent = self.parse_utterances(utterances, lang)
+                    # No conversation, use intent system to handle utterance
+                    intent = self._adapt_intent_match(utterances, lang)
+                    padatious_intent = PadatiousService.instance.calc_intent(
+                                        utterances[0])
 
             if converse:
                 # Report that converse handled the intent and return
@@ -280,25 +308,31 @@ class IntentService(object):
                 report_timing(ident, 'intent_service', stopwatch,
                               {'intent_type': 'converse'})
                 return
-            elif intent:
-                # Send the message on to the intent handler
+            elif intent and not (padatious_intent and
+                                 padatious_intent.conf >= 0.95):
+                # Send the message to the Adapt intent's handler unless
+                # Padatious is REALLY sure it was directed at it instead.
                 reply = message.reply(intent.get('intent_type'), intent)
             else:
-                # or if no match send sentence to fallback system
+                # Allow fallback system to handle utterance
+                # NOTE: Padatious intents are handled this way, too
                 reply = message.reply('intent_failure',
                                       {'utterance': utterances[0],
                                        'lang': lang})
-            self.emitter.emit(reply)
+            self.bus.emit(reply)
             self.send_metrics(intent, message.context, stopwatch)
         except Exception as e:
             LOG.exception(e)
 
-    def parse_converse(self, utterances, lang):
-        """
-            Converse, check if a recently invoked skill wants to
-            handle the utterance and override normal adapt handling.
+    def _converse(self, utterances, lang):
+        """ Give active skills a chance at the utterance
 
-            Returns: True if converse handled the utterance, else False.
+        Args:
+            utterances (list):  list of utterances
+            lang (string):      4 letter ISO language code
+
+        Returns:
+            bool: True if converse handled it, False if  no skill processes it
         """
 
         # check for conversation time-out
@@ -315,15 +349,15 @@ class IntentService(object):
                 return True
         return False
 
-    def parse_utterances(self, utterances, lang):
-        """
-            Parse the utteracne using adapt  to find a matching intent.
+    def _adapt_intent_match(self, utterances, lang):
+        """ Run the Adapt engine to search for an matching intent
 
-            Args:
-                utterances (list):  list of utterances
-                lang (string):      4 letter ISO language code
+        Args:
+            utterances (list):  list of utterances
+            lang (string):      4 letter ISO language code
 
-            Returns: Intent structure, or None if no match was found.
+        Returns:
+            Intent structure, or None if no match was found.
         """
         best_intent = None
         for utterance in utterances:
@@ -345,8 +379,14 @@ class IntentService(object):
         if best_intent and best_intent.get('confidence', 0.0) > 0.0:
             self.update_context(best_intent)
             # update active skills
-            skill_id = int(best_intent['intent_type'].split(":")[0])
+            skill_id = best_intent['intent_type'].split(":")[0]
             self.add_active_skill(skill_id)
+            # adapt doesn't handle context injection for one_of keywords
+            # correctly. Workaround this issue if possible.
+            try:
+                best_intent = workaround_one_of_context(best_intent)
+            except LookupError:
+                LOG.error('Error during workaround_one_of_context')
             return best_intent
 
     def handle_register_vocab(self, message):
@@ -378,18 +418,18 @@ class IntentService(object):
         self.engine.intent_parsers = new_parsers
 
     def handle_add_context(self, message):
-        """
-            Handles adding context from the message bus.
-            The data field must contain a context keyword and
-            may contain a word if a specific word should be injected
-            as a match for the provided context keyword.
+        """ Add context
 
+        Args:
+            message: data contains the 'context' item to add
+                     optionally can include 'word' to be injected as
+                     an alias for the context item.
         """
         entity = {'confidence': 1.0}
         context = message.data.get('context')
         word = message.data.get('word') or ''
         # if not a string type try creating a string from it
-        if not isinstance(word, basestring):
+        if not isinstance(word, str):
             word = str(word)
         entity['data'] = [(word, context)]
         entity['match'] = word
@@ -397,16 +437,15 @@ class IntentService(object):
         self.context_manager.inject_context(entity)
 
     def handle_remove_context(self, message):
-        """
-            Handles removing context from the message bus. The
-            data field must contain the 'context' to remove.
+        """ Remove specific context
+
+        Args:
+            message: data contains the 'context' item to remove
         """
         context = message.data.get('context')
         if context:
             self.context_manager.remove_context(context)
 
     def handle_clear_context(self, message):
-        """
-            Clears all keywords from context.
-        """
+        """ Clears all keywords from context """
         self.context_manager.clear_context()
