@@ -440,7 +440,6 @@ class TTSFactory(object):
     from mycroft.tts.mary_tts import MaryTTS
     from mycroft.tts.mimic_tts import Mimic
     from mycroft.tts.spdsay_tts import SpdSay
-    from mycroft.tts.ibm_tts import IBMTTS
     from mycroft.tts.bing_tts import BingTTS
     from mycroft.tts.ibm_tts import WatsonTTS
     from mycroft.tts.responsive_voice_tts import ResponsiveVoice
@@ -478,6 +477,5 @@ class TTSFactory(object):
         tts_lang = tts_config.get('lang', lang)
         clazz = TTSFactory.CLASSES.get(tts_module)
         tts = clazz(tts_lang, tts_config)
-
         tts.validator.validate()
         return tts
