@@ -28,7 +28,7 @@ from mycroft.util import validate_param, create_echo_function
 from mycroft.util.log import LOG
 
 
-class WebsocketClient(object):
+class WebsocketClient:
     def __init__(self, host=None, port=None, route=None, ssl=None):
 
         config = Configuration.get().get("websocket")
@@ -86,6 +86,7 @@ class WebsocketClient(object):
         time.sleep(self.retry)
         self.retry = min(self.retry * 2, 60)
         try:
+            self.emitter.emit('reconnecting')
             self.client = self.create_client()
             self.run_forever()
         except WebSocketException:

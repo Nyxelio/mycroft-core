@@ -14,7 +14,10 @@
 #
 import sys
 import io
+import signal
 from math import ceil
+
+from .gui_server import start_qml_gui
 
 from mycroft.tts import TTS
 
@@ -29,6 +32,7 @@ from threading import Thread, Lock
 from mycroft.messagebus.client.ws import WebsocketClient
 from mycroft.messagebus.message import Message
 from mycroft.util.log import LOG
+from mycroft.configuration import Configuration
 
 import locale
 # Curses uses LC_ALL to determine how to display chars set it to system
@@ -38,6 +42,8 @@ preferred_encoding = locale.getpreferredencoding()
 
 bSimple = False
 bus = None  # Mycroft messagebus connection
+config = {}  # Will be populated by the Mycroft configuration
+event_thread = None
 history = []
 chat = []   # chat history, oldest at the lowest index
 line = ""
@@ -50,6 +56,8 @@ auto_scroll = True
 # for debugging odd terminals
 last_key = ""
 show_last_key = False
+show_gui = None  # None = not initialized, else True/False
+gui_text = []
 
 log_lock = Lock()
 max_log_lines = 5000
@@ -90,14 +98,34 @@ CLR_INPUT = 0
 CLR_LOG1 = 0
 CLR_LOG2 = 0
 CLR_LOG_DEBUG = 0
+CLR_LOG_ERROR = 0
 CLR_LOG_CMDMESSAGE = 0
 CLR_METER_CUR = 0
 CLR_METER = 0
 
+# Allow Ctrl+C catching...
+ctrl_c_was_pressed = False
+
+
+def ctrl_c_handler(signum, frame):
+    global ctrl_c_was_pressed
+    ctrl_c_was_pressed = True
+
+
+def ctrl_c_pressed():
+    global ctrl_c_was_pressed
+    if ctrl_c_was_pressed:
+        ctrl_c_was_pressed = False
+        return True
+    else:
+        return False
+
+
+signal.signal(signal.SIGINT, ctrl_c_handler)
+
 
 ##############################################################################
 # Helper functions
-
 
 def clamp(n, smallest, largest):
     """ Force n to be between smallest and largest, inclusive """
@@ -121,6 +149,25 @@ def handleNonAscii(text):
 config_file = os.path.join(os.path.expanduser("~"), ".mycroft_cli.conf")
 
 
+def load_mycroft_config(bus):
+    """ Load the mycroft config and connect it to updates over the messagebus.
+    """
+    Configuration.init(bus)
+    return Configuration.get()
+
+
+def connect_to_mycroft():
+    """ Connect to the mycroft messagebus and load and register config
+        on the bus.
+
+        Sets the bus and config global variables
+    """
+    global bus
+    global config
+    bus = connect_to_messagebus()
+    config = load_mycroft_config(bus)
+
+
 def load_settings():
     global log_filters
     global cy_chat_area
@@ -141,8 +188,8 @@ def load_settings():
             max_log_lines = config["max_log_lines"]
         if "show_meter" in config:
             show_meter = config["show_meter"]
-    except:
-        pass
+    except Exception as e:
+        LOG.info("Ignoring failed load of settings file")
 
 
 def save_settings():
@@ -209,13 +256,13 @@ class LogMonitorThread(Thread):
 
                 with log_lock:
                     if ignore:
-                        mergedLog.append(self.logid + line.strip())
+                        mergedLog.append(self.logid + line.rstrip())
                     else:
                         if bSimple:
-                            print(line.strip())
+                            print(line.rstrip())
                         else:
-                            filteredLog.append(self.logid + line.strip())
-                            mergedLog.append(self.logid + line.strip())
+                            filteredLog.append(self.logid + line.rstrip())
+                            mergedLog.append(self.logid + line.rstrip())
                             if not auto_scroll:
                                 log_line_offset += 1
 
@@ -358,7 +405,7 @@ def rebuild_filtered_log():
             else:
                 # Apply filters
                 for filtered_text in log_filters:
-                    if filtered_text in line:
+                    if filtered_text and filtered_text in line:
                         ignore = True
                         break
 
@@ -389,8 +436,12 @@ def handle_utterance(event):
     set_screen_dirty()
 
 
-def connect():
-    # Once the websocket has connected, just watch it for speak events
+def connect(bus):
+    """ Run the mycroft messagebus referenced by bus.
+
+        Arguments:
+            bus:    Mycroft messagebus instance
+    """
     bus.run_forever()
 
 
@@ -401,6 +452,45 @@ def handle_message(msg):
     # TODO: Think this thru a little bit -- remove this logging within core?
     # add_log_message(msg)
     pass
+
+
+##############################################################################
+# "Graphic primitives"
+def draw(x, y, msg, pad=None, pad_chr=None, clr=None):
+    """Draw a text to the screen
+
+    Args:
+        x (int): X coordinate (col), 0-based from upper-left
+        y (int): Y coordinate (row), 0-based from upper-left
+        msg (str): string to render to screen
+        pad (bool or int, optional): if int, pads/clips to given length, if
+                                     True use right edge of the screen.
+        pad_chr (char, optional): pad character, default is space
+        clr (int, optional): curses color, Defaults to CLR_LOG1.
+    """
+    if y < 0 or y > curses.LINES or x < 0 or x > curses.COLS:
+        return
+
+    if x + len(msg) > curses.COLS:
+        s = msg[:curses.COLS-x]
+    else:
+        s = msg
+        if pad:
+            ch = pad_chr or " "
+            if pad is True:
+                pad = curses.COLS  # pad to edge of screen
+                s += ch * (pad-x-len(msg))
+            else:
+                # pad to given length (or screen width)
+                if x+pad > curses.COLS:
+                    pad = curses.COLS-x
+                s += ch * (pad-len(msg))
+
+    if not clr:
+        clr = CLR_LOG1
+
+    scr.addstr(y, x, s, clr)
+
 
 ##############################################################################
 # Screen handling
@@ -416,6 +506,7 @@ def init_screen():
     global CLR_LOG1
     global CLR_LOG2
     global CLR_LOG_DEBUG
+    global CLR_LOG_ERROR
     global CLR_LOG_CMDMESSAGE
     global CLR_METER_CUR
     global CLR_METER
@@ -440,6 +531,7 @@ def init_screen():
         CLR_LOG1 = curses.color_pair(3)
         CLR_LOG2 = curses.color_pair(6)
         CLR_LOG_DEBUG = curses.color_pair(4)
+        CLR_LOG_ERROR = curses.color_pair(2)
         CLR_LOG_CMDMESSAGE = curses.color_pair(2)
         CLR_METER_CUR = curses.color_pair(2)
         CLR_METER = curses.color_pair(4)
@@ -528,6 +620,24 @@ def _do_meter(height):
                        "*", clr_bar)
 
 
+def _do_gui(gui_width):
+    clr = curses.color_pair(2)  # dark red
+    x = curses.COLS - gui_width
+    y = 3
+    draw(x, y, " "+make_titlebar("= GUI", gui_width-1)+" ", clr=CLR_HEADING)
+    cnt = len(gui_text)+1
+    if cnt > curses.LINES-15:
+        cnt = curses.LINES-15
+    for i in range(0, cnt):
+        draw(x, y+1+i, " !", clr=CLR_HEADING)
+        if i < len(gui_text):
+            draw(x+2, y+1+i, gui_text[i], pad=gui_width-3)
+        else:
+            draw(x+2, y+1+i, "*"*(gui_width-3))
+        draw(x+(gui_width-1), y+1+i, "!", clr=CLR_HEADING)
+    draw(x, y+cnt, " "+"-"*(gui_width-2)+" ", clr=CLR_HEADING)
+
+
 def set_screen_dirty():
     global is_screen_dirty
     global screen_lock
@@ -601,6 +711,8 @@ def do_draw_main(scr):
         if " - DEBUG - " in log:
             log = log.replace("Skills ", "")
             clr = CLR_LOG_DEBUG
+        elif " - ERROR - " in log:
+            clr = CLR_LOG_ERROR
         else:
             if logid == "1":
                 clr = CLR_LOG1
@@ -684,13 +796,16 @@ def do_draw_main(scr):
         scr.addstr(y, 1, handleNonAscii(txt), clr)
         y += 1
 
+    if show_gui and curses.COLS > 20 and curses.LINES > 20:
+        _do_gui(curses.COLS-20)
+
     # Command line at the bottom
-    l = line
+    ln = line
     if len(line) > 0 and line[0] == ":":
         scr.addstr(curses.LINES - 2, 0, "Command ('help' for options):",
                    CLR_CMDLINE)
         scr.addstr(curses.LINES - 1, 0, ":", CLR_CMDLINE)
-        l = line[1:]
+        ln = line[1:]
     else:
         prompt = "Input (':' for command, Ctrl+C to quit)"
         if show_last_key:
@@ -702,7 +817,7 @@ def do_draw_main(scr):
         scr.addstr(curses.LINES - 1, 0, ">", CLR_HEADING)
 
     _do_meter(cy_chat_area + 2)
-    scr.addstr(curses.LINES - 1, 2, l, CLR_INPUT)
+    scr.addstr(curses.LINES - 1, 2, ln[-(curses.COLS - 3):], CLR_INPUT)
 
     # Curses doesn't actually update the display until refresh() is called
     scr.refresh()
@@ -713,6 +828,7 @@ def make_titlebar(title, bar_length):
 
 ##############################################################################
 # Help system
+
 
 help_struct = [
     (
@@ -924,11 +1040,14 @@ def center(str_len):
 ##############################################################################
 # Main UI lopo
 
-def _get_cmd_param(cmd):
+def _get_cmd_param(cmd, keyword):
     # Returns parameter to a command.  Will de-quote.
     # Ex: find 'abc def'   returns: abc def
     #    find abc def     returns: abc def
-    cmd = cmd.strip()
+    cmd = cmd.replace(keyword, "").strip()
+    if not cmd:
+        return None
+
     last_char = cmd[-1]
     if last_char == '"' or last_char == "'":
         parts = cmd.split(last_char)
@@ -967,7 +1086,7 @@ def handle_cmd(cmd):
         elif "show" in cmd or "on" in cmd:
             show_meter = True
     elif "find" in cmd:
-        find_str = _get_cmd_param(cmd)
+        find_str = _get_cmd_param(cmd, "find")
         rebuild_filtered_log()
     elif "filter" in cmd:
         if "show" in cmd or "list" in cmd:
@@ -979,19 +1098,19 @@ def handle_cmd(cmd):
             log_filters = list(default_log_filters)
         else:
             # extract last word(s)
-            param = _get_cmd_param(cmd)
-
-            if "remove" in cmd and param in log_filters:
-                log_filters.remove(param)
-            else:
-                log_filters.append(param)
+            param = _get_cmd_param(cmd, "filter")
+            if param:
+                if "remove" in cmd and param in log_filters:
+                    log_filters.remove(param)
+                else:
+                    log_filters.append(param)
 
         rebuild_filtered_log()
         add_log_message("Filters: " + str(log_filters))
     elif "history" in cmd:
         # extract last word(s)
-        lines = int(_get_cmd_param(cmd))
-        if lines < 1:
+        lines = int(_get_cmd_param(cmd, "history"))
+        if not lines or lines < 1:
             lines = 1
         max_chat_area = curses.LINES - 7
         if lines > max_chat_area:
@@ -1033,6 +1152,15 @@ def handle_cmd(cmd):
     return 0  # do nothing upon return
 
 
+def handle_is_connected(msg):
+    add_log_message("Connected to Messagebus!")
+    # start_qml_gui(bus, gui_text)
+
+
+def handle_reconnecting():
+    add_log_message("Looking for Messagebus websocket...")
+
+
 def gui_main(stdscr):
     global scr
     global bus
@@ -1043,19 +1171,21 @@ def gui_main(stdscr):
     global last_key
     global history
     global screen_lock
+    global show_gui
+    global config
 
     scr = stdscr
     init_screen()
     scr.keypad(1)
-    scr.notimeout(1)
+    scr.notimeout(True)
 
-    bus = WebsocketClient()  # Mycroft messagebus connection
     bus.on('speak', handle_speak)
     bus.on('message', handle_message)
     bus.on('recognizer_loop:utterance', handle_utterance)
-    event_thread = Thread(target=connect)
-    event_thread.setDaemon(True)
-    event_thread.start()
+    bus.on('connected', handle_is_connected)
+    bus.on('reconnecting', handle_reconnecting)
+
+    add_log_message("Establishing Mycroft Messagebus connection...")
 
     gui_thread = ScreenDrawThread()
     gui_thread.setDaemon(True)  # this thread won't prevent prog from exiting
@@ -1066,20 +1196,22 @@ def gui_main(stdscr):
     try:
         while True:
             set_screen_dirty()
+            c = 0
+            code = 0
 
             try:
-                c = scr.get_wch()  # unicode char or int for special keys
-            except KeyboardInterrupt:
-                # User hit Ctrl+C to quit
-                if find_str:
-                    # End the find session
-                    find_str = None
-                    rebuild_filtered_log()
-                    continue  # Consumed the Ctrl+C, get next character
+                if ctrl_c_pressed():
+                    # User hit Ctrl+C. treat same as Ctrl+X
+                    c = 24
                 else:
-                    c = 24  # treat as Ctrl+X (Exit)
+                    # Don't block, this allows us to refresh the screen while
+                    # waiting on initial messagebus connection, etc
+                    scr.timeout(1)
+                    c = scr.get_wch()   # unicode char or int for special keys
+                    if c == -1:
+                        continue
             except curses.error:
-                # This happens in odd cases, such as when you Ctrl+Z suspend
+                # This happens in odd cases, such as when you Ctrl+Z
                 # the CLI and then resume.  Curses fails on get_wch().
                 continue
 
@@ -1108,7 +1240,6 @@ def gui_main(stdscr):
                         c2 = scr.getch()
                         if time.time()-start > 1:  # 1 second timeout
                             break  # 1 second timeout waiting for ESC code
-                    scr.timeout(-1)
 
                 if c1 == 79 and c2 == 120:
                     c = curses.KEY_UP
@@ -1140,6 +1271,7 @@ def gui_main(stdscr):
                 else:
                     last_key = str(code)
 
+            scr.timeout(-1)     # resume blocking
             if code == 27:    # Hitting ESC twice clears the entry line
                 hist_idx = -1
                 line = ""
@@ -1168,7 +1300,7 @@ def gui_main(stdscr):
                     # Treat this as an utterance
                     bus.emit(Message("recognizer_loop:utterance",
                                      {'utterances': [line.strip()],
-                                      'lang': 'en-us'}))
+                                      'lang': config.get('lang', 'en-us')}))
                 hist_idx = -1
                 line = ""
             elif code == 16 or code == 545:  # Ctrl+P or Ctrl+Left (Previous)
@@ -1218,6 +1350,10 @@ def gui_main(stdscr):
                 line = line[:-1]
             elif code == 6:  # Ctrl+F (Find)
                 line = ":find "
+            elif code == 7:  # Ctrl+G (start GUI)
+                if show_gui is None:
+                    start_qml_gui(bus, gui_text)
+                show_gui = not show_gui
             elif code == 18:  # Ctrl+R (Redraw)
                 scr.erase()
             elif code == 24:  # Ctrl+X (Exit)
@@ -1225,7 +1361,11 @@ def gui_main(stdscr):
                     # End the find session
                     find_str = None
                     rebuild_filtered_log()
+                elif line.startswith(":"):
+                    # cancel command mode
+                    line = ""
                 else:
+                    # exit CLI
                     break
             elif code > 31 and isinstance(c, str):
                 # Accept typed character in the utterance
@@ -1238,13 +1378,9 @@ def gui_main(stdscr):
 
 
 def simple_cli():
-    global bus
     global bSimple
     bSimple = True
-    bus = WebsocketClient()  # Mycroft messagebus connection
-    event_thread = Thread(target=connect)
-    event_thread.setDaemon(True)
-    event_thread.start()
+
     bus.on('speak', handle_speak)
     try:
         while True:
@@ -1262,3 +1398,17 @@ def simple_cli():
         LOG.exception(e)
         event_thread.exit()
         sys.exit()
+
+
+def connect_to_messagebus():
+    """ Connect to the mycroft messagebus and launch a thread handling the
+        connection.
+
+        Returns: WebsocketClient
+    """
+    bus = WebsocketClient()  # Mycroft messagebus connection
+
+    event_thread = Thread(target=connect, args=[bus])
+    event_thread.setDaemon(True)
+    event_thread.start()
+    return bus

@@ -17,6 +17,8 @@ from copy import copy
 import json
 import requests
 from requests import HTTPError, RequestException
+import os
+import time
 
 from mycroft.configuration import Configuration
 from mycroft.configuration.config import DEFAULT_CONFIG, SYSTEM_CONFIG, \
@@ -37,8 +39,8 @@ class InternetDown(RequestException):
     pass
 
 
-class Api(object):
-    """ Generic object to wrap web APIs """
+class Api:
+    """ Generic class to wrap web APIs """
     params_to_etag = {}
     etag_to_response = {}
 
@@ -85,12 +87,21 @@ class Api(object):
                 })
                 IdentityManager.save(data, lock=False)
                 LOG.debug('Saved credentials')
+            except HTTPError as e:
+                if e.response.status_code == 401:
+                    LOG.error('Could not refresh token, invalid refresh code.')
+                else:
+                    raise
+
             finally:
                 identity_lock.release()
         else:  # Someone is updating the identity wait for release
-            LOG.debug('Refresh is already in progress, waiting until done')
-            self.identity = IdentityManager.load()
-            LOG.debug('new credentials loaded')
+            with identity_lock:
+                LOG.debug('Refresh is already in progress, waiting until done')
+                time.sleep(1.2)
+                os.sync()
+                self.identity = IdentityManager.load(lock=False)
+                LOG.debug('new credentials loaded')
 
     def send(self, params, no_refresh=False):
         """ Send request to mycroft backend.
@@ -346,6 +357,18 @@ class DeviceApi(Api):
             "method": "GET",
             "path": "/" + self.identity.uuid + "/token/" + str(dev_cred)
         })
+
+    def upload_skills_data(self, data):
+        """ Upload skills.json file.
+
+        Arguments:
+             data: dictionary with skills data from msm
+        """
+        self.request({
+            "method": "PUT",
+            "path": "/" + self.identity.uuid + "/skillJson",
+            "json": data
+            })
 
 
 class STTApi(Api):

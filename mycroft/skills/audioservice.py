@@ -42,9 +42,9 @@ def ensure_uri(s):
         raise ValueError('Invalid track')
 
 
-class AudioService(object):
+class AudioService:
     """
-        AudioService object for interacting with the audio subsystem
+        AudioService class for interacting with the audio subsystem
 
         Arguments:
             bus: Mycroft messagebus connection
@@ -77,7 +77,7 @@ class AudioService(object):
         self.bus.emit(Message('mycroft.audio.service.queue',
                               data={'tracks': tracks}))
 
-    def play(self, tracks=None, utterance='', repeat=None):
+    def play(self, tracks=None, utterance=None, repeat=None):
         """ Start playback.
 
             Args:
@@ -90,6 +90,7 @@ class AudioService(object):
         """
         repeat = repeat or False
         tracks = tracks or []
+        utterance = utterance or ''
         if isinstance(tracks, (str, tuple)):
             tracks = [tracks]
         elif not isinstance(tracks, list):
@@ -119,6 +120,38 @@ class AudioService(object):
     def resume(self):
         """ Resume paused playback. """
         self.bus.emit(Message('mycroft.audio.service.resume'))
+
+    def seek(self, seconds=1):
+        """
+        seek X seconds
+
+         Args:
+                seconds (int): number of seconds to seek, if negative rewind
+        """
+        if seconds < 0:
+            self.seek_backward(abs(seconds))
+        else:
+            self.seek_forward(seconds)
+
+    def seek_forward(self, seconds=1):
+        """
+        skip ahead X seconds
+
+         Args:
+                seconds (int): number of seconds to skip
+        """
+        self.bus.emit(Message('mycroft.audio.service.seek_forward',
+                              {"seconds": seconds}))
+
+    def seek_backward(self, seconds=1):
+        """
+        rewind X seconds
+
+         Args:
+                seconds (int): number of seconds to rewind
+        """
+        self.bus.emit(Message('mycroft.audio.service.seek_backward',
+                              {"seconds": seconds}))
 
     def track_info(self):
         """ Request information of current playing track.

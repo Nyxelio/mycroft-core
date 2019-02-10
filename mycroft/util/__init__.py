@@ -16,6 +16,8 @@ from __future__ import absolute_import
 import re
 import socket
 import subprocess
+import pyaudio
+
 from os.path import join, expanduser
 
 from threading import Thread
@@ -89,6 +91,17 @@ def resolve_resource_file(res_name):
 
 
 def play_wav(uri):
+    """ Play a wav-file.
+
+        This will use the application specified in the mycroft config
+        and play the uri passed as argument. The function will return directly
+        and play the file in the background.
+
+        Arguments:
+            uri:    uri to play
+
+        Returns: subprocess.Popen object
+    """
     config = mycroft.configuration.Configuration.get()
     play_cmd = config.get("play_wav_cmdline")
     play_wav_cmd = str(play_cmd).split(" ")
@@ -99,6 +112,17 @@ def play_wav(uri):
 
 
 def play_mp3(uri):
+    """ Play a mp3-file.
+
+        This will use the application specified in the mycroft config
+        and play the uri passed as argument. The function will return directly
+        and play the file in the background.
+
+        Arguments:
+            uri:    uri to play
+
+        Returns: subprocess.Popen object
+    """
     config = mycroft.configuration.Configuration.get()
     play_cmd = config.get("play_mp3_cmdline")
     play_mp3_cmd = str(play_cmd).split(" ")
@@ -109,6 +133,17 @@ def play_mp3(uri):
 
 
 def play_ogg(uri):
+    """ Play a ogg-file.
+
+        This will use the application specified in the mycroft config
+        and play the uri passed as argument. The function will return directly
+        and play the file in the background.
+
+        Arguments:
+            uri:    uri to play
+
+        Returns: subprocess.Popen object
+    """
     config = mycroft.configuration.Configuration.get()
     play_cmd = config.get("play_ogg_cmdline")
     play_ogg_cmd = str(play_cmd).split(" ")
@@ -126,6 +161,27 @@ def record(file_path, duration, rate, channels):
     else:
         return subprocess.Popen(
             ["arecord", "-r", str(rate), "-c", str(channels), file_path])
+
+
+def find_input_device(device_name):
+    """ Find audio input device by name.
+
+        Arguments:
+            device_name: device name or regex pattern to match
+
+        Returns: device_index (int) or None if device wasn't found
+    """
+    LOG.info('Searching for input device: {}'.format(device_name))
+    LOG.debug('Devices: ')
+    pa = pyaudio.PyAudio()
+    pattern = re.compile(device_name)
+    for device_index in range(pa.get_device_count()):
+        dev = pa.get_device_info_by_index(device_index)
+        LOG.debug('   {}'.format(dev['name']))
+        if dev['maxInputChannels'] > 0 and pattern.match(dev['name']):
+            LOG.debug('    ^-- matched')
+            return device_index
+    return None
 
 
 def get_http(uri):
@@ -244,7 +300,7 @@ def curate_cache(directory, min_free_percent=5.0, min_free_disk=50):
             try:
                 os.remove(path)
                 space_freed += fsize
-            except:
+            except Exception:
                 pass
 
             if space_freed > bytes_needed:

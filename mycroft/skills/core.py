@@ -20,6 +20,7 @@ import time
 import csv
 import inspect
 import os
+import traceback
 from inspect import signature
 from datetime import datetime, timedelta
 
@@ -45,6 +46,15 @@ from mycroft.util import camel_case_split, resolve_resource_file
 from mycroft.util.log import LOG
 
 MainModule = '__init__'
+
+
+def simple_trace(stack_trace):
+    stack_trace = stack_trace[:-1]
+    tb = "Traceback:\n"
+    for line in stack_trace:
+        if line.strip():
+            tb += line
+    return tb
 
 
 def dig_for_message():
@@ -104,31 +114,29 @@ def load_skill(skill_descriptor, bus, skill_id, BLACKLISTED_SKILLS=None):
     BLACKLISTED_SKILLS = BLACKLISTED_SKILLS or []
     path = skill_descriptor["path"]
     name = basename(path)
-    LOG.info("ATTEMPTING TO LOAD SKILL: {} with ID {}".format(
-        name, skill_id
-    ))
+    LOG.info("ATTEMPTING TO LOAD SKILL: {} with ID {}".format(name, skill_id))
     if name in BLACKLISTED_SKILLS:
         LOG.info("SKILL IS BLACKLISTED " + name)
         return None
     main_file = join(path, MainModule + '.py')
     try:
         with open(main_file, 'rb') as fp:
-            skill_module = imp.load_module(
-                name.replace('.', '_'), fp, main_file,
-                ('.py', 'rb', imp.PY_SOURCE)
-            )
+            skill_module = imp.load_module(name.replace('.', '_'), fp,
+                                           main_file, ('.py', 'rb',
+                                           imp.PY_SOURCE))
         if (hasattr(skill_module, 'create_skill') and
                 callable(skill_module.create_skill)):
             # v2 skills framework
             skill = skill_module.create_skill()
+            skill.skill_id = skill_id
             skill.settings.allow_overwrite = True
             skill.settings.load_skill_settings_from_file()
             skill.bind(bus)
             try:
-                skill.skill_id = skill_id
                 skill.load_data_files(path)
                 # Set up intent handlers
                 skill._register_decorated()
+                skill.register_resting_screen()
                 skill.initialize()
             except Exception as e:
                 # If an exception occurs, make sure to clean up the skill
@@ -148,6 +156,10 @@ def load_skill(skill_descriptor, bus, skill_id, BLACKLISTED_SKILLS=None):
             return skill
         else:
             LOG.warning("Module {} does not appear to be skill".format(name))
+    except FileNotFoundError as e:
+        LOG.error(
+            'Failed to load {} due to a missing file: {}'.format(name, str(e))
+            )
     except Exception:
         LOG.exception("Failed to load skill: " + name)
     return None
@@ -166,11 +178,10 @@ def get_handler_name(handler):
     Returns:
         string: handler name as string
     """
-    name = ''
     if '__self__' in dir(handler) and 'name' in dir(handler.__self__):
-        name += handler.__self__.name + '.'
-    name += handler.__name__
-    return name
+        return handler.__self__.name + '.' + handler.__name__
+    else:
+        return handler.__name__
 
 
 def intent_handler(intent_parser):
@@ -201,10 +212,201 @@ def intent_file_handler(intent_file):
     return real_decorator
 
 
+class SkillGUI:
+    """
+    SkillGUI - Interface to the Graphical User Interface
+
+    Values set in this class are synced to the GUI, accessible within QML
+    via the built-in sessionData mechanism.  For example, in Python you can
+    write in a skill:
+        self.gui['temp'] = 33
+        self.gui.show_page('Weather.qml')
+    Then in the Weather.qml you'd access the temp via code such as:
+        text: sessionData.time
+    """
+
+    def __init__(self, skill):
+        self.__session_data = {}  # synced to GUI for use by this skill's pages
+        self.page = None    # the active GUI page (e.g. QML template) to show
+        self.skill = skill
+        self.on_gui_changed_callback = None
+
+    def build_message_type(self, event):
+        """ Builds a message matching the output from the enclosure. """
+        return '{}.{}'.format(self.skill.skill_id, event)
+
+    def setup_default_handlers(self):
+        """ Sets the handlers for the default messages. """
+        msg_type = self.build_message_type('set')
+        print("LISTENING FOR {}".format(msg_type))
+        self.skill.add_event(msg_type, self.gui_set)
+
+    def register_handler(self, event, handler):
+        """ Register a handler for gui events.
+
+            when using the triggerEvent method from Qt
+            triggerEvent("event", {"data": "cool"})
+
+            Arguments:
+                event (str):    event to catch
+                handler:        function to handle the event
+        """
+        msg_type = self.build_message_type(event)
+        self.skill.add_event(msg_type, handler)
+
+    def set_on_gui_changed(self, callback):
+        """ Registers a callback function to run when a value is
+            changed from the GUI.
+
+            Arguments:
+                callback:   Function to call when a value is changed
+        """
+        self.on_gui_changed_callback = callback
+
+    def gui_set(self, message):
+        for key in message.data:
+            print("SETTING {} TO {}".format(key, message.data[key]))
+            self[key] = message.data[key]
+        if self.on_gui_changed_callback:
+            self.on_gui_changed_callback()
+
+    def __setitem__(self, key, value):
+        self.__session_data[key] = value
+
+        if self.page:
+            # emit notification (but not needed if page has not been shown yet)
+            data = self.__session_data.copy()
+            data.update({'__from': self.skill.skill_id})
+            self.skill.bus.emit(Message("gui.value.set", data))
+
+    def __getitem__(self, key):
+        return self.__session_data[key]
+
+    def __contains__(self, key):
+        return self.__session_data.__contains__(key)
+
+    def clear(self):
+        """ Reset the value dictionary """
+        self.__session_data = {}
+        self.page = None
+
+    def show_page(self, name, override_idle=None):
+        """
+        Begin showing the page in the GUI
+
+        Args:
+            name (str): Name of page (e.g "mypage.qml") to display
+            override_idle: If set will override the idle screen
+        """
+        self.show_pages([name], 0, override_idle)
+
+    def show_pages(self, page_names, index=0, override_idle=None):
+        """
+        Begin showing the list of pages in the GUI
+
+        Args:
+            page_names (list): List of page names (str) to display, such as
+                               ["Weather.qml", "Forecast.qml", "Details.qml"]
+            index (int): Page number (0-based) to show initially.  For the
+                         above list a value of 1 would start on "Forecast.qml"
+            override_idle: If set will override the idle screen
+        """
+        if not isinstance(page_names, list):
+            raise ValueError('page_names must be a list')
+
+        if index > len(page_names):
+            raise ValueError('Default index is larger than page list length')
+
+        self.page = page_names[index]
+
+        # First sync any data...
+        data = self.__session_data.copy()
+        data.update({'__from': self.skill.skill_id})
+        self.skill.bus.emit(Message("gui.value.set", data))
+
+        # Convert pages to full reference
+        page_urls = []
+        for name in page_names:
+            page = self.skill.find_resource(name, 'ui')
+            if page:
+                page_urls.append("file://" + page)
+            else:
+                raise FileNotFoundError("Unable to find page: {}".format(name))
+
+        self.skill.bus.emit(Message("gui.page.show",
+                                    {"page": page_urls,
+                                     "index": index,
+                                     "__from": self.skill.skill_id,
+                                     "__idle": override_idle}))
+
+    def show_text(self, text, title=None):
+        """ Display a GUI page for viewing simple text
+
+        Arguments:
+            text (str): Main text content.  It will auto-paginate
+            title (str): A title to display above the text content.
+        """
+        self.clear()
+        self["text"] = text
+        self["title"] = title
+        self.show_page("SYSTEM_TEXTFRAME")
+
+    def show_image(self, url, caption=None, title=None):
+        """ Display a GUI page for viewing an image
+
+        Arguments:
+            url (str): Pointer to the image
+            caption (str): A caption to show under the image
+            title (str): A title to display above the image content
+        """
+        self.clear()
+        self["image"] = url
+        self["title"] = title
+        self["caption"] = caption
+        self.show_page("SYSTEM_IMAGEFRAME")
+
+    def show_html(self, html):
+        """ Display an HTML page in the GUI
+
+        Arguments:
+            html (str): HTML text to display
+        """
+        self.clear()
+        self["url"] = ""  # TODO: Save to a temp file... html
+        self.show_page("SYSTEM_HTMLFRAME")
+
+    def show_url(self, url):
+        """ Display an HTML page in the GUI
+
+        Arguments:
+            url (str): URL to render
+        """
+        self.clear()
+        self["url"] = url
+        self.show_page("SYSTEM_HTMLFRAME")
+
+
+def resting_screen_handler(name=None):
+    """ Decorator for adding a method as an resting screen handler.
+
+        If selected will be shown on screen when device enters idle mode
+    """
+    name = name or func.__self__.name
+
+    def real_decorator(func):
+        # Store the resting information inside the function
+        # This will be used later in register_resting_screen
+        if not hasattr(func, 'resting_handler'):
+            func.resting_handler = name
+        return func
+
+    return real_decorator
+
+
 #######################################################################
 # MycroftSkill base class
 #######################################################################
-class MycroftSkill(object):
+class MycroftSkill:
     """
     Abstract base class which provides common behaviour and parameters to all
     Skills implementation.
@@ -212,24 +414,52 @@ class MycroftSkill(object):
 
     def __init__(self, name=None, bus=None):
         self.name = name or self.__class__.__name__
+        self.resting_name = None
         # Get directory of skill
         self._dir = dirname(abspath(sys.modules[self.__module__].__file__))
         self.settings = SkillSettings(self._dir, self.name)
 
-        self.bus = None
+        self.gui = SkillGUI(self)
+
+        self._bus = None
+        self._enclosure = None
         self.bind(bus)
+        #: Mycroft global configuration. (dict)
         self.config_core = Configuration.get()
         self.config = self.config_core.get(self.name) or {}
         self.dialog_renderer = None
-        self.root_dir = None
+        self.root_dir = None  #: skill root directory
+
+        #: Filesystem access to skill specific folder.
+        #: See mycroft.filesystem for details.
         self.file_system = FileSystemAccess(join('skills', self.name))
         self.registered_intents = []
-        self.log = LOG.create_logger(self.name)
-        self.reload_skill = True  # allow reloading
+        self.log = LOG.create_logger(self.name)  #: Skill logger instance
+        self.reload_skill = True  #: allow reloading (default True)
         self.events = []
         self.scheduled_repeats = []
         self.skill_id = ''  # will be set from the path, so guaranteed unique
         self.voc_match_cache = {}
+
+    @property
+    def enclosure(self):
+        if self._enclosure:
+            return self._enclosure
+        else:
+            LOG.error("Skill not fully initialized. Move code " +
+                      "from  __init__() to initialize() to correct this.")
+            LOG.error(simple_trace(traceback.format_stack()))
+            raise Exception("Accessed MycroftSkill.enclosure in __init__")
+
+    @property
+    def bus(self):
+        if self._bus:
+            return self._bus
+        else:
+            LOG.error("Skill not fully initialized. Move code " +
+                      "from __init__() to initialize() to correct this.")
+            LOG.error(simple_trace(traceback.format_stack()))
+            raise Exception("Accessed MycroftSkill.bus in __init__")
 
     @property
     def emitter(self):
@@ -237,7 +467,7 @@ class MycroftSkill(object):
         TODO: Remove in 19.02
         """
         self.log.warning('self.emitter is deprecated switch to "self.bus"')
-        return self.bus
+        return self._bus
 
     @property
     def location(self):
@@ -273,18 +503,24 @@ class MycroftSkill(object):
             bus: Mycroft messagebus connection
         """
         if bus:
-            self.bus = bus
-            self.enclosure = EnclosureAPI(bus, self.name)
+            self._bus = bus
+            self._enclosure = EnclosureAPI(bus, self.name)
             self.add_event('mycroft.stop', self.__handle_stop)
             self.add_event('mycroft.skill.enable_intent',
                            self.handle_enable_intent)
             self.add_event('mycroft.skill.disable_intent',
                            self.handle_disable_intent)
-
+            self.add_event("mycroft.skill.set_cross_context",
+                           self.handle_set_cross_context)
+            self.add_event("mycroft.skill.remove_cross_context",
+                           self.handle_remove_cross_context)
             name = 'mycroft.skills.settings.update'
             func = self.settings.run_poll
             bus.on(name, func)
             self.events.append((name, func))
+
+            # Intialize the SkillGui
+            self.gui.setup_default_handlers()
 
     def detach(self):
         for (name, intent) in self.registered_intents:
@@ -403,8 +639,7 @@ class MycroftSkill(object):
         validator = validator or validator_default
         on_fail_fn = on_fail if callable(on_fail) else on_fail_default
 
-        self.speak(get_announcement(), expect_response=True)
-        wait_while_speaking()
+        self.speak(get_announcement(), expect_response=True, wait=True)
         num_fails = 0
         while True:
             response = self.__get_response()
@@ -445,11 +680,10 @@ class MycroftSkill(object):
 
         if self.voc_match(resp, 'yes'):
             return 'yes'
-
-        if self.voc_match(resp, 'no'):
+        elif self.voc_match(resp, 'no'):
             return 'no'
-
-        return resp
+        else:
+            return resp
 
     def voc_match(self, utt, voc_filename, lang=None):
         """ Determine if the given utterance contains the vocabulary provided
@@ -520,6 +754,43 @@ class MycroftSkill(object):
         self.bus.emit(Message('active_skill_request',
                               {"skill_id": self.skill_id}))
 
+    def _handle_collect_resting(self, message=None):
+        """ Handler for collect resting screen messages.
+
+            Sends info on how to trigger this skills resting page.
+        """
+        self.log.info('Registering resting screen')
+        self.bus.emit(Message('mycroft.mark2.register_idle',
+                              data={'name': self.resting_name,
+                                    'id': self.skill_id}))
+
+    def register_resting_screen(self):
+        """ Registers resting screen from the resting_screen_handler decorator.
+
+            This only allows one screen and if two is registered only one
+            will be used.
+        """
+        attributes = [a for a in dir(self) if a != 'emitter']
+        for attr_name in attributes:
+            method = getattr(self, attr_name)
+
+            if hasattr(method, 'resting_handler'):
+                self.resting_name = method.resting_handler
+                self.log.info('Registering resting screen {} for {}.'.format(
+                              method, self.resting_name))
+
+                # Register for handling resting screen
+                msg_type = '{}.{}'.format(self.skill_id, 'idle')
+                self.add_event(msg_type, method)
+                # Register handler for resting screen collect message
+                self.add_event('mycroft.mark2.collect_idle',
+                               self._handle_collect_resting)
+
+                # Do a send at load to make sure the skill is registered
+                # if reloaded
+                self._handle_collect_resting()
+                return
+
     def _register_decorated(self):
         """ Register all intent handlers that are decorated with an intent.
 
@@ -555,27 +826,35 @@ class MycroftSkill(object):
         """
         return self.dialog_renderer.render(text, data or {})
 
-    def find_resource(self, res_name, old_dirname=None):
-        """ Find a text resource file
+    def find_resource(self, res_name, res_dirname=None):
+        """ Find a resource file
 
-        Searches for the given filename in either the old-style directory
-        (e.g. "<root>/<old_dirname>/<lang>/<res_name>") or somewhere under the
-        new localization folder "<root>/locale/<lang>/*/<res_name>".  The new
-        method allows arbitrary organization, so the res_name would be found
-        at "<root>/locale/<lang>/<res_name>", or an arbitrary folder like
-        "<root>/locale/<lang>/somefolder/<res_name>".
+        Searches for the given filename using this scheme:
+        1) Search the resource lang directory:
+             <skill>/<res_dirname>/<lang>/<res_name>
+        2) Search the resource directory:
+             <skill>/<res_dirname>/<res_name>
+        3) Search the locale lang directory or other subdirectory:
+             <skill>/locale/<lang>/<res_name> or
+             <skill>/locale/<lang>/.../<res_name>
 
         Args:
             res_name (string): The resource name to be found
-            old_dirname (string, optional): Defaults to None. One of the old
-                               resource folders: 'dialog', 'vocab', or 'regex'
+            res_dirname (string, optional): A skill resource directory, such
+                                            'dialog', 'vocab', 'regex' or 'ui'.
+                                            Defaults to None.
 
         Returns:
-            string: The full path to the resource or None if not found
+            string: The full path to the resource file or None if not found
         """
-        if old_dirname:
-            # Try the old directory (dialog/vocab/regex)
-            path = join(self.root_dir, old_dirname, self.lang, res_name)
+        if res_dirname:
+            # Try the old translated directory (dialog/vocab/regex)
+            path = join(self.root_dir, res_dirname, self.lang, res_name)
+            if exists(path):
+                return path
+
+            # Try old-style non-translated resource
+            path = join(self.root_dir, res_dirname, res_name)
             if exists(path):
                 return path
 
@@ -815,7 +1094,9 @@ class MycroftSkill(object):
 
         filename = self.find_resource(intent_file, 'vocab')
         if not filename:
-            raise ValueError('Unable to find "' + str(intent_file) + '"')
+            raise FileNotFoundError(
+                'Unable to find "' + str(intent_file) + '"'
+                )
 
         data = {
             "file_name": filename,
@@ -847,7 +1128,9 @@ class MycroftSkill(object):
 
         filename = self.find_resource(entity_file + ".entity", 'vocab')
         if not filename:
-            raise ValueError('Unable to find "' + entity_file + '.entity"')
+            raise FileNotFoundError(
+                'Unable to find "' + entity_file + '.entity"'
+                )
         name = str(self.skill_id) + ':' + entity_file
 
         self.bus.emit(Message("padatious:register_entity", {
@@ -921,7 +1204,7 @@ class MycroftSkill(object):
                                                       'registered.')
         return False
 
-    def set_context(self, context, word=''):
+    def set_context(self, context, word='', origin=None):
         """
             Add context to intent service
 
@@ -933,16 +1216,60 @@ class MycroftSkill(object):
             raise ValueError('context should be a string')
         if not isinstance(word, str):
             raise ValueError('word should be a string')
+
+        origin = origin or ''
         context = to_alnum(self.skill_id) + context
         self.bus.emit(Message('add_context',
-                              {'context': context, 'word': word}))
+                              {'context': context, 'word': word,
+                               'origin': origin}))
 
-    def remove_context(self, context):
+    def handle_set_cross_context(self, message):
         """
-            remove_context removes a keyword from from the context manager.
+            Add global context to intent service
+
+        """
+        context = message.data.get("context")
+        word = message.data.get("word")
+        origin = message.data.get("origin")
+
+        self.set_context(context, word, origin)
+
+    def handle_remove_cross_context(self, message):
+        """
+            Remove global context from intent service
+
+        """
+        context = message.data.get("context")
+        self.remove_context(context)
+
+    def set_cross_skill_context(self, context, word=''):
+        """
+            Tell all skills to add a context to intent service
+
+            Args:
+                context:    Keyword
+                word:       word connected to keyword
+        """
+        self.bus.emit(Message("mycroft.skill.set_cross_context",
+                              {"context": context, "word": word,
+                               "origin": self.skill_id}))
+
+    def remove_cross_skill_context(self, context):
+        """
+           tell all skills to remove a keyword from the context manager.
         """
         if not isinstance(context, str):
             raise ValueError('context should be a string')
+        self.bus.emit(Message("mycroft.skill.remove_cross_context",
+                              {"context": context}))
+
+    def remove_context(self, context):
+        """
+            remove a keyword from the context manager.
+        """
+        if not isinstance(context, str):
+            raise ValueError('context should be a string')
+        context = to_alnum(self.skill_id) + context
         self.bus.emit(Message('remove_context', {'context': context}))
 
     def register_vocabulary(self, entity, entity_type):
@@ -1099,7 +1426,7 @@ class MycroftSkill(object):
             Message("detach_skill", {"skill_id": str(self.skill_id) + ":"}))
         try:
             self.stop()
-        except:  # noqa
+        except Exception:
             LOG.error("Failed to stop skill: {}".format(self.name),
                       exc_info=True)
 
@@ -1230,27 +1557,29 @@ class MycroftSkill(object):
         data = {'name': event_name}
 
         # making event_status an object so it's refrence can be changed
-        event_status = [None]
-        finished_callback = [False]
+        event_status = None
+        finished_callback = False
 
         def callback(message):
+            nonlocal event_status
+            nonlocal finished_callback
             if message.data is not None:
                 event_time = int(message.data[0][0])
                 current_time = int(time.time())
                 time_left_in_seconds = event_time - current_time
-                event_status[0] = time_left_in_seconds
-            finished_callback[0] = True
+                event_status = time_left_in_seconds
+            finished_callback = True
 
         emitter_name = 'mycroft.event_status.callback.{}'.format(event_name)
         self.bus.once(emitter_name, callback)
         self.bus.emit(Message('mycroft.scheduler.get_event', data=data))
 
         start_wait = time.time()
-        while finished_callback[0] is False and time.time() - start_wait < 3.0:
+        while finished_callback is False and time.time() - start_wait < 3.0:
             time.sleep(0.1)
         if time.time() - start_wait > 3.0:
             raise Exception("Event Status Messagebus Timeout")
-        return event_status[0]
+        return event_status
 
     def cancel_all_repeating_events(self):
         """ Cancel any repeating events started by the skill. """
@@ -1348,7 +1677,7 @@ class FallbackSkill(MycroftSkill):
             return False
 
         self.instance_fallback_handlers.append(wrapper)
-        self._register_fallback(handler, priority)
+        self._register_fallback(wrapper, priority)
 
     @classmethod
     def remove_fallback(cls, handler_to_del):

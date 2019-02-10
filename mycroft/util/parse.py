@@ -23,13 +23,16 @@ from mycroft.util.lang.parse_es import *
 from mycroft.util.lang.parse_it import *
 from mycroft.util.lang.parse_sv import *
 from mycroft.util.lang.parse_de import extractnumber_de
+from mycroft.util.lang.parse_de import extract_numbers_de
 from mycroft.util.lang.parse_de import extract_datetime_de
 from mycroft.util.lang.parse_de import normalize_de
 from mycroft.util.lang.parse_fr import extractnumber_fr
+from mycroft.util.lang.parse_fr import extract_numbers_fr
 from mycroft.util.lang.parse_fr import extract_datetime_fr
 from mycroft.util.lang.parse_fr import normalize_fr
 
 from mycroft.util.lang.parse_common import *
+from .log import LOG
 
 
 def fuzzy_match(x, against):
@@ -70,6 +73,32 @@ def match_one(query, choices):
         return best
 
 
+def extract_numbers(text, short_scale=True, ordinals=False, lang="en-us"):
+    """
+        Takes in a string and extracts a list of numbers.
+
+    Args:
+        text (str): the string to extract a number from
+        short_scale (bool): Use "short scale" or "long scale" for large
+            numbers -- over a million.  The default is short scale, which
+            is now common in most English speaking countries.
+            See https://en.wikipedia.org/wiki/Names_of_large_numbers
+        ordinals (bool): consider ordinal numbers, e.g. third=3 instead of 1/3
+        lang (str): the BCP-47 code for the language to use
+    Returns:
+        list: list of extracted numbers as floats
+    """
+    if lang.startswith("en"):
+        return extract_numbers_en(text, short_scale, ordinals)
+    elif lang.startswith("de"):
+        return extract_numbers_de(text, short_scale, ordinals)
+    elif lang.startswith("fr"):
+        return extract_numbers_fr(text, short_scale, ordinals)
+    elif lang.startswith("it"):
+        return extract_numbers_it(text, short_scale, ordinals)
+    return []
+
+
 def extract_number(text, short_scale=True, ordinals=False, lang="en-us"):
     """Takes in a string and extracts a number.
 
@@ -102,6 +131,9 @@ def extract_number(text, short_scale=True, ordinals=False, lang="en-us"):
     elif lang_lower.startswith("de"):
         return extractnumber_de(text)
     # TODO: extractnumber_xx for other languages
+    LOG.warning('Language "{}" not recognized! Please make sure your '
+                'language is one of the following: '
+                'en, es, pt, it, fr, sv, de.'.format(lang_lower))
     return text
 
 
@@ -177,8 +209,11 @@ def extract_datetime(text, anchorDate=None, lang="en-us", default_time=None):
     elif lang_lower.startswith("de"):
         return extract_datetime_de(text, anchorDate, default_time)
     # TODO: extract_datetime for other languages
+    LOG.warning('Language "{}" not recognized! Please make sure your '
+                'language is one of the following: '
+                'en, es, pt, it, fr, sv, de.'.format(lang_lower))
     return text
-# ==============================================================
+    # ==============================================================
 
 
 def normalize(text, lang="en-us", remove_articles=True):
@@ -211,6 +246,9 @@ def normalize(text, lang="en-us", remove_articles=True):
     elif lang_lower.startswith("de"):
         return normalize_de(text, remove_articles)
     # TODO: Normalization for other languages
+    LOG.warning('Language "{}" not recognized! Please make sure your '
+                'language is one of the following: '
+                'en, es, pt, it, fr, sv, de.'.format(lang_lower))
     return text
 
 

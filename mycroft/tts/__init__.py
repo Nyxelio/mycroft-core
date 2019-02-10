@@ -128,6 +128,10 @@ class PlaybackThread(Thread):
                 True if button has been pressed.
         """
         start = time()
+        if self.enclosure:
+            self.enclosure.mouth_viseme_list(start, pairs)
+
+        # TODO 19.02 Remove the one by one method below
         for code, duration in pairs:
             if self._clear_visimes:
                 self._clear_visimes = False
@@ -143,6 +147,11 @@ class PlaybackThread(Thread):
     def clear_visimes(self):
         self._clear_visimes = True
 
+    def clear(self):
+        """ Clear all pending actions for the TTS playback thread. """
+        self.clear_queue()
+        self.clear_visimes()
+
     def blink(self, rate=1.0):
         """ Blink mycroft's eyes """
         if self.enclosure and random.random() < rate:
@@ -154,7 +163,7 @@ class PlaybackThread(Thread):
         self.clear_queue()
 
 
-class TTS(object):
+class TTS:
     """
     TTS abstract class to be implemented by all TTS engines.
 
@@ -384,7 +393,7 @@ class TTS(object):
         self.playback.join()
 
 
-class TTSValidator(object):
+class TTSValidator:
     """
     TTS Validator abstract class to be implemented by all TTS engines.
 
@@ -433,7 +442,7 @@ class TTSValidator(object):
         pass
 
 
-class TTSFactory(object):
+class TTSFactory:
     from mycroft.tts.espeak_tts import ESpeak
     from mycroft.tts.fa_tts import FATTS
     from mycroft.tts.google_tts import GoogleTTS

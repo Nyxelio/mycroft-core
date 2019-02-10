@@ -45,7 +45,7 @@ def workaround_one_of_context(best_intent):
     return best_intent
 
 
-class ContextManager(object):
+class ContextManager:
     """
     ContextManager
     Use to track context throughout the course of a conversational session.
@@ -108,13 +108,21 @@ class ContextManager(object):
 
         missing_entities = list(missing_entities)
         context = []
+        last = ''
+        depth = 0
         for i in range(max_frames):
             frame_entities = [entity.copy() for entity in
                               relevant_frames[i].entities]
             for entity in frame_entities:
                 entity['confidence'] = entity.get('confidence', 1.0) \
-                    / (2.0 + i)
+                    / (2.0 + depth)
             context += frame_entities
+
+            # Update depth
+            if entity['origin'] != last or entity['origin'] == '':
+                depth += 1
+            last = entity['origin']
+            print(depth)
 
         result = []
         if len(missing_entities) > 0:
@@ -141,7 +149,7 @@ class ContextManager(object):
         return result
 
 
-class IntentService(object):
+class IntentService:
     def __init__(self, bus):
         self.config = Configuration.get().get('context', {})
         self.engine = IntentDeterminationEngine()
@@ -166,6 +174,7 @@ class IntentService(object):
         self.bus.on('clear_context', self.handle_clear_context)
         # Converse method
         self.bus.on('skill.converse.response', self.handle_converse_response)
+        self.bus.on('skill.converse.error', self.handle_converse_error)
         self.bus.on('mycroft.speech.recognition.unknown', self.reset_converse)
         self.bus.on('mycroft.skills.loaded', self.update_skill_name_dict)
 
@@ -174,6 +183,9 @@ class IntentService(object):
         self.bus.on('active_skill_request', add_active_skill_handler)
         self.active_skills = []  # [skill_id , timestamp]
         self.converse_timeout = 5  # minutes to prune active_skills
+        self.waiting_for_converse = False
+        self.converse_result = False
+        self.converse_skill_id = ""
 
     def update_skill_name_dict(self, message):
         """
@@ -200,25 +212,33 @@ class IntentService(object):
             self.do_converse(None, skill[0], lang)
 
     def do_converse(self, utterances, skill_id, lang):
-        self.waiting = True
-        self.result = False
+        self.waiting_for_converse = True
+        self.converse_result = False
+        self.converse_skill_id = skill_id
         self.bus.emit(Message("skill.converse.request", {
             "skill_id": skill_id, "utterances": utterances, "lang": lang}))
         start_time = time.time()
         t = 0
-        while self.waiting and t < 5:
+        while self.waiting_for_converse and t < 5:
             t = time.time() - start_time
             time.sleep(0.1)
-        self.waiting = False
-        return self.result
+        self.waiting_for_converse = False
+        self.converse_skill_id = ""
+        return self.converse_result
+
+    def handle_converse_error(self, message):
+        skill_id = message.data["skill_id"]
+        if message.data["error"] == "skill id does not exist":
+            self.remove_active_skill(skill_id)
+        if skill_id == self.converse_skill_id:
+            self.converse_result = False
+            self.waiting_for_converse = False
 
     def handle_converse_response(self, message):
-        # id = message.data["skill_id"]
-        # no need to crosscheck id because waiting before new request is made
-        # no other skill will make this request is safe assumption
-        result = message.data["result"]
-        self.result = result
-        self.waiting = False
+        skill_id = message.data["skill_id"]
+        if skill_id == self.converse_skill_id:
+            self.converse_result = message.data.get("result", False)
+            self.waiting_for_converse = False
 
     def remove_active_skill(self, skill_id):
         for skill in self.active_skills:
@@ -428,12 +448,14 @@ class IntentService(object):
         entity = {'confidence': 1.0}
         context = message.data.get('context')
         word = message.data.get('word') or ''
+        origin = message.data.get('origin') or ''
         # if not a string type try creating a string from it
         if not isinstance(word, str):
             word = str(word)
         entity['data'] = [(word, context)]
         entity['match'] = word
         entity['key'] = word
+        entity['origin'] = origin
         self.context_manager.inject_context(entity)
 
     def handle_remove_context(self, message):

@@ -14,11 +14,14 @@
 #
 
 from mycroft.tts import TTS, TTSValidator
-from mycroft.tts.remote_tts import RemoteTTS
+from mycroft.tts.remote_tts import RemoteTTSTimeoutException
 from mycroft.util.log import LOG
 from mycroft.util.format import pronounce_number
 from mycroft.util import play_wav, get_cache_directory, create_signal
 from requests_futures.sessions import FuturesSession
+from requests.exceptions import (
+    ReadTimeout, ConnectionError, ConnectTimeout, HTTPError
+)
 from urllib import parse
 from .mimic_tts import VISIMES
 import math
@@ -26,6 +29,7 @@ import base64
 import os
 import hashlib
 import re
+import json
 
 
 max_sentence_size = 170
@@ -204,10 +208,6 @@ class Mimic2(TTS):
                 '%s Http Error: %s for url: %s' %
                 (req.status_code, req.reason, req.url))
 
-    def build_request_params(self, sentence):
-        """RemoteTTS expects this method as abc.abstractmethod"""
-        pass
-
     def _requests(self, chunks):
         """create asynchronous request list
 
@@ -222,7 +222,7 @@ class Mimic2(TTS):
             if len(chunk) > 0:
                 url = self.url + parse.quote(chunk)
                 req_route = url + "&visimes=True"
-                reqs.append(self.session.get(req_route))
+                reqs.append(self.session.get(req_route, timeout=5))
         return reqs
 
     def visime(self, phonemes):
@@ -258,7 +258,7 @@ class Mimic2(TTS):
             stf: normalized sentences to speak
         """
         try:
-            numbers = re.findall(r'\d+', sentence)
+            numbers = re.findall(r'-?\d+', sentence)
             normalized_num = [
                 (num, pronounce_number(int(num)))
                 for num in numbers
@@ -269,15 +269,13 @@ class Mimic2(TTS):
             LOG.exception("type error in mimic2_tts.py _normalized_numbers()")
         return sentence
 
-    def execute(self, sentence, ident=None):
+    def get_tts(self, sentence, wav_file):
         """request and play mimic2 wav audio
 
         Args:
             sentence (str): sentence to synthesize from mimic2
             ident (optional): Defaults to None.
         """
-        create_signal("isSpeaking")
-
         sentence = self._normalized_numbers(sentence)
 
         # Use the phonetic_spelling mechanism from the TTS base class
@@ -288,19 +286,52 @@ class Mimic2(TTS):
                                                 self.spellings[word.lower()])
 
         chunks = sentence_chunker(sentence, self.chunk_size)
-        for idx, req in enumerate(self._requests(chunks)):
-            results = req.result().json()
-            audio = base64.b64decode(results['audio_base64'])
-            vis = self.visime(results['visimes'])
-            key = str(hashlib.md5(
-                chunks[idx].encode('utf-8', 'ignore')).hexdigest())
-            wav_file = os.path.join(
-                get_cache_directory("tts"),
-                key + '.' + self.audio_ext
+        try:
+            for idx, req in enumerate(self._requests(chunks)):
+                results = req.result().json()
+                audio = base64.b64decode(results['audio_base64'])
+                vis = results['visimes']
+                with open(wav_file, 'wb') as f:
+                    f.write(audio)
+        except (ReadTimeout, ConnectionError, ConnectTimeout, HTTPError):
+            raise RemoteTTSTimeoutException(
+                "Mimic 2 remote server request timedout. falling back to mimic"
             )
-            with open(wav_file, 'wb') as f:
-                f.write(audio)
-            self.queue.put((self.audio_ext, wav_file, vis, ident))
+        return (wav_file, vis)
+
+    def save_phonemes(self, key, phonemes):
+        """
+            Cache phonemes
+
+            Args:
+                key:        Hash key for the sentence
+                phonemes:   phoneme string to save
+        """
+
+        cache_dir = get_cache_directory("tts")
+        pho_file = os.path.join(cache_dir, key + ".pho")
+        try:
+            with open(pho_file, "w") as cachefile:
+                cachefile.write(json.dumps(phonemes))
+        except Exception:
+            LOG.exception("Failed to write {} to cache".format(pho_file))
+
+    def load_phonemes(self, key):
+        """
+            Load phonemes from cache file.
+
+            Args:
+                Key:    Key identifying phoneme cache
+        """
+        pho_file = os.path.join(get_cache_directory("tts"), key + ".pho")
+        if os.path.exists(pho_file):
+            try:
+                with open(pho_file, "r") as cachefile:
+                    phonemes = json.load(cachefile)
+                return phonemes
+            except Exception as e:
+                LOG.error("Failed to read .PHO from cache ({})".format(e))
+        return None
 
 
 class Mimic2Validator(TTSValidator):

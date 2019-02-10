@@ -43,7 +43,7 @@ class NoModelAvailable(Exception):
     pass
 
 
-class HotWordEngine(object):
+class HotWordEngine:
     def __init__(self, key_phrase="hey mycroft", config=None, lang="en-us"):
         self.key_phrase = str(key_phrase).lower()
         # rough estimate 1 phoneme per 2 chars
@@ -59,6 +59,14 @@ class HotWordEngine(object):
         return False
 
     def update(self, chunk):
+        pass
+
+    def stop(self):
+        """ Perform any actions needed to shut down the hot word engine.
+
+            This may include things such as unload loaded data or shutdown
+            external processess.
+        """
         pass
 
 
@@ -222,6 +230,10 @@ class PreciseHotword(HotWordEngine):
             return True
         return False
 
+    def stop(self):
+        if self.runner:
+            self.runner.stop()
+
 
 class SnowboyHotWord(HotWordEngine):
     def __init__(self, key_phrase="hey mycroft", config=None, lang="en-us"):
@@ -249,7 +261,7 @@ class SnowboyHotWord(HotWordEngine):
         return wake_word == 1
 
 
-class HotWordFactory(object):
+class HotWordFactory:
     CLASSES = {
         "pocketsphinx": PocketsphinxHotWord,
         "precise": PreciseHotword,

@@ -13,8 +13,6 @@
 # limitations under the License.
 #
 import random
-from io import open
-
 import os
 import re
 from pathlib import Path
@@ -29,7 +27,7 @@ __doc__ = """
 """
 
 
-class MustacheDialogRenderer(object):
+class MustacheDialogRenderer:
     """
     A dialog template renderer based on the mustache templating language.
     """
@@ -45,20 +43,23 @@ class MustacheDialogRenderer(object):
             template_name (str): a unique identifier for a group of templates
             filename (str): a fully qualified filename of a mustache template.
         """
-        with open(filename, 'r') as f:
+        with open(filename, 'r', encoding='utf8') as f:
             for line in f:
                 template_text = line.strip()
-                if template_name not in self.templates:
-                    self.templates[template_name] = []
+                # Skip all lines starting with '#' and all empty lines
+                if (not template_text.startswith('#') and
+                        template_text != ''):
+                    if template_name not in self.templates:
+                        self.templates[template_name] = []
 
-                # convert to standard python format string syntax. From
-                # double (or more) '{' followed by any number of whitespace
-                # followed by actual key followed by any number of whitespace
-                # followed by double (or more) '}'
-                template_text = re.sub(r'\{\{+\s*(.*?)\s*\}\}+', r'{\1}',
-                                       template_text)
+                    # convert to standard python format string syntax. From
+                    # double (or more) '{' followed by any number of
+                    # whitespace followed by actual key followed by any number
+                    # of whitespace followed by double (or more) '}'
+                    template_text = re.sub(r'\{\{+\s*(.*?)\s*\}\}+', r'{\1}',
+                                           template_text)
 
-                self.templates[template_name].append(template_text)
+                    self.templates[template_name].append(template_text)
 
     def render(self, template_name, context=None, index=None):
         """
@@ -84,15 +85,15 @@ class MustacheDialogRenderer(object):
 
         template_functions = self.templates.get(template_name)
         if index is None:
-            index = random.randrange(len(template_functions))
+            line = random.choice(template_functions)
         else:
-            index %= len(template_functions)
-        line = template_functions[index]
+            line = template_functions[index % len(template_functions)]
+        # Replace {key} in line with matching values from context
         line = line.format(**context)
         return line
 
 
-class DialogLoader(object):
+class DialogLoader:
     """
     Loads a collection of dialog files into a renderer implementation.
     """
@@ -112,7 +113,7 @@ class DialogLoader(object):
         """
         directory = Path(dialog_dir)
         if not directory.exists() or not directory.is_dir():
-            LOG.warning("No dialog files found: " + dialog_dir)
+            LOG.warning("No dialog files found: {}".format(dialog_dir))
             return self.__renderer
 
         for path, _, files in os.walk(str(directory)):
@@ -146,7 +147,7 @@ def get(phrase, lang=None, context=None):
     filename = "text/" + lang.lower() + "/" + phrase + ".dialog"
     template = resolve_resource_file(filename)
     if not template:
-        LOG.debug("Resource file not found: " + filename)
+        LOG.debug("Resource file not found: {}".format(filename))
         return phrase
 
     stache = MustacheDialogRenderer()

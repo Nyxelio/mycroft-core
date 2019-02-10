@@ -18,9 +18,10 @@ from datetime import datetime
 
 from dateutil.relativedelta import relativedelta
 
-from mycroft.util.lang.parse_common import is_numeric, look_for_fractions
+from mycroft.util.lang.parse_common import is_numeric, look_for_fractions, \
+    extract_numbers_generic
 from mycroft.util.lang.format_en import NUM_STRING_EN, LONG_SCALE_EN, \
-    SHORT_SCALE_EN
+    SHORT_SCALE_EN, pronounce_number_en
 
 SHORT_ORDINAL_STRING_EN = {
     1: 'first',
@@ -127,14 +128,17 @@ def extractnumber_en(text, short_scale=True, ordinals=False):
     """
 
     string_num_en = {
-                     "half": 0.5,
-                     "halves": 0.5,
-                     "hundred": 100,
-                     "hundreds": 100,
-                     "thousand": 1000,
-                     "thousands": 1000,
-                     "million": 1000000,
-                     'millions': 1000000}
+        "half": 0.5,
+        "halves": 0.5,
+        "couple": 2,
+        "hundred": 100,
+        "hundreds": 100,
+        "thousand": 1000,
+        "thousands": 1000,
+        "million": 1000000,
+        'millions': 1000000}
+
+    string_num_ordinal_en = {}
 
     for num in NUM_STRING_EN:
         num_string = NUM_STRING_EN[num]
@@ -145,10 +149,12 @@ def extractnumber_en(text, short_scale=True, ordinals=False):
         if short_scale:
             for num in SHORT_ORDINAL_STRING_EN:
                 num_string = SHORT_ORDINAL_STRING_EN[num]
+                string_num_ordinal_en[num_string] = num
                 string_num_en[num_string] = num
         else:
             for num in LONG_ORDINAL_STRING_EN:
                 num_string = LONG_ORDINAL_STRING_EN[num]
+                string_num_ordinal_en[num_string] = num
                 string_num_en[num_string] = num
 
     # negate next number (-2 = 0 - 2)
@@ -227,6 +233,11 @@ def extractnumber_en(text, short_scale=True, ordinals=False):
         if word in string_num_en:
             val = string_num_en[word]
 
+        # is the prev word an ordinal number and current word is one?
+        # second one, third one
+        if ordinals and prev_word in string_num_ordinal_en and val is 1:
+            val = prev_val
+
         # is the prev word a number and should we sum it?
         # twenty two, fifty six
         if prev_word in sums and word in string_num_en:
@@ -266,6 +277,7 @@ def extractnumber_en(text, short_scale=True, ordinals=False):
 
         else:
             prev_val = val
+
             # handle long numbers
             # six hundred sixty six
             # two million five hundred thousand
@@ -313,7 +325,9 @@ def extract_datetime_en(string, dateNow, default_time):
             .replace(' the ', ' ').replace(' a ', ' ').replace(' an ', ' ') \
             .replace("o' clock", "o'clock").replace("o clock", "o'clock") \
             .replace("o ' clock", "o'clock").replace("o 'clock", "o'clock") \
-            .replace("oclock", "o'clock")
+            .replace("oclock", "o'clock").replace("couple", "2") \
+            .replace("centuries", "century").replace("decades", "decade") \
+            .replace("millenniums", "millennium")
 
         wordList = s.split()
         for idx, word in enumerate(wordList):
@@ -357,7 +371,7 @@ def extract_datetime_en(string, dateNow, default_time):
     timeQualifiersAM = ['morning']
     timeQualifiersPM = ['afternoon', 'evening', 'tonight', 'night']
     timeQualifiersList = set(timeQualifiersAM + timeQualifiersPM)
-    markers = ['at', 'in', 'on', 'by', 'this', 'around', 'for', 'of']
+    markers = ['at', 'in', 'on', 'by', 'this', 'around', 'for', 'of', "within"]
     days = ['monday', 'tuesday', 'wednesday',
             'thursday', 'friday', 'saturday', 'sunday']
     months = ['january', 'february', 'march', 'april', 'may', 'june',
@@ -365,6 +379,8 @@ def extract_datetime_en(string, dateNow, default_time):
               'december']
     monthsShort = ['jan', 'feb', 'mar', 'apr', 'may', 'june', 'july', 'aug',
                    'sept', 'oct', 'nov', 'dec']
+    year_multiples = ["decade", "century", "millennium"]
+    day_multiples = ["weeks", "months", "years"]
 
     words = clean_string(string)
 
@@ -381,9 +397,49 @@ def extract_datetime_en(string, dateNow, default_time):
         start = idx
         used = 0
         # save timequalifier for later
-        if word in timeQualifiersList:
+
+        if word == "now" and not datestr:
+            resultStr = " ".join(words[idx + 1:])
+            resultStr = ' '.join(resultStr.split())
+            extractedDate = dateNow.replace(microsecond=0)
+            return [extractedDate, resultStr]
+        elif wordNext in year_multiples:
+            multiplier = None
+            if is_numeric(word):
+                multiplier = extractnumber_en(word)
+            multiplier = multiplier or 1
+            multiplier = int(multiplier)
+            used += 2
+            if wordNext == "decade":
+                yearOffset = multiplier * 10
+            elif wordNext == "century":
+                yearOffset = multiplier * 100
+            elif wordNext == "millennium":
+                yearOffset = multiplier * 1000
+        # couple of
+        elif word == "2" and wordNext == "of" and \
+                wordNextNext in year_multiples:
+            multiplier = 2
+            used += 3
+            if wordNextNext == "decade":
+                yearOffset = multiplier * 10
+            elif wordNextNext == "century":
+                yearOffset = multiplier * 100
+            elif wordNextNext == "millennium":
+                yearOffset = multiplier * 1000
+        elif word == "2" and wordNext == "of" and \
+                wordNextNext in day_multiples:
+            multiplier = 2
+            used += 3
+            if wordNextNext == "years":
+                yearOffset = multiplier
+            elif wordNextNext == "months":
+                monthOffset = multiplier
+            elif wordNextNext == "weeks":
+                dayOffset = multiplier * 7
+        elif word in timeQualifiersList:
             timeQualifier = word
-            # parse today, tomorrow, day after tomorrow
+        # parse today, tomorrow, day after tomorrow
         elif word == "today" and not fromFlag:
             dayOffset = 0
             used += 1
@@ -433,7 +489,7 @@ def extract_datetime_en(string, dateNow, default_time):
                 monthOffset = -1
                 start -= 1
                 used = 2
-                # parse 5 years, next year, last year
+        # parse 5 years, next year, last year
         elif word == "year" and not fromFlag:
             if wordPrev[0].isdigit():
                 yearOffset = int(wordPrev)
@@ -447,8 +503,8 @@ def extract_datetime_en(string, dateNow, default_time):
                 yearOffset = -1
                 start -= 1
                 used = 2
-                # parse Monday, Tuesday, etc., and next Monday,
-                # last Tuesday, etc.
+        # parse Monday, Tuesday, etc., and next Monday,
+        # last Tuesday, etc.
         elif word in days and not fromFlag:
             d = days.index(word)
             dayOffset = (d + 1) - int(today)
@@ -579,6 +635,16 @@ def extract_datetime_en(string, dateNow, default_time):
             if hrAbs is None:
                 hrAbs = 19
             used += 1
+        # couple of time_unit
+        elif word == "2" and wordNext == "of" and \
+                wordNextNext in ["hours", "minutes", "seconds"]:
+            used += 3
+            if wordNextNext == "hours":
+                hrOffset = 2
+            elif wordNextNext == "minutes":
+                minOffset = 2
+            elif wordNextNext == "seconds":
+                secOffset = 2
         # parse half an hour, quarter hour
         elif word == "hour" and \
                 (wordPrev in markers or wordPrevPrev in markers):
@@ -593,6 +659,8 @@ def extract_datetime_en(string, dateNow, default_time):
                     if words[idx - 3] == "this":
                         daySpecified = True
                 words[idx - 2] = ""
+            elif wordPrev == "within":
+                hrOffset = 1
             else:
                 hrOffset = 1
             if wordPrevPrev in markers:
@@ -604,6 +672,16 @@ def extract_datetime_en(string, dateNow, default_time):
             hrAbs = -1
             minAbs = -1
             # parse 5:00 am, 12:00 p.m., etc
+        # parse in a minute
+        elif word == "minute" and wordPrev == "in":
+            minOffset = 1
+            words[idx - 1] = ""
+            used += 1
+        # parse in a second
+        elif word == "second" and wordPrev == "in":
+            secOffset = 1
+            words[idx - 1] = ""
+            used += 1
         elif word[0].isdigit():
             isTime = True
             strHH = ""
@@ -684,7 +762,7 @@ def extract_datetime_en(string, dateNow, default_time):
                             military = True
                             if strHH and int(strHH) <= 12 and \
                                     (timeQualifier in timeQualifiersPM):
-                                strHH += str(int(strHH)+12)
+                                strHH += str(int(strHH) + 12)
             else:
                 # try to parse numbers without colons
                 # 5 hours, 10 minutes etc.
@@ -819,7 +897,9 @@ def extract_datetime_en(string, dateNow, default_time):
             HH = HH - 12 if remainder == "am" and HH >= 12 else HH
 
             if (not military and
-                    remainder not in ['am', 'pm', 'hours', 'minutes'] and
+                    remainder not in ['am', 'pm', 'hours', 'minutes',
+                                      "second", "seconds",
+                                      "hour", "minute"] and
                     ((not daySpecified) or dayOffset < 1)):
                 # ambiguous time, detect whether they mean this evening or
                 # the next morning based on whether it has already passed
@@ -895,10 +975,10 @@ def extract_datetime_en(string, dateNow, default_time):
                                 tzinfo=extractedDate.tzinfo)
             if extractedDate < temp:
                 extractedDate = extractedDate.replace(
-                                    year=int(currentYear),
-                                    month=int(temp.strftime("%m")),
-                                    day=int(temp.strftime("%d")),
-                                    tzinfo=extractedDate.tzinfo)
+                    year=int(currentYear),
+                    month=int(temp.strftime("%m")),
+                    day=int(temp.strftime("%d")),
+                    tzinfo=extractedDate.tzinfo)
             else:
                 extractedDate = extractedDate.replace(
                     year=int(currentYear) + 1,
@@ -979,6 +1059,24 @@ def isFractional_en(input_str, short_scale=True):
     if input_str.lower() in fracts:
         return 1.0 / fracts[input_str.lower()]
     return False
+
+
+def extract_numbers_en(text, short_scale=True, ordinals=False):
+    """
+        Takes in a string and extracts a list of numbers.
+
+    Args:
+        text (str): the string to extract a number from
+        short_scale (bool): Use "short scale" or "long scale" for large
+            numbers -- over a million.  The default is short scale, which
+            is now common in most English speaking countries.
+            See https://en.wikipedia.org/wiki/Names_of_large_numbers
+        ordinals (bool): consider ordinal numbers, e.g. third=3 instead of 1/3
+    Returns:
+        list: list of extracted numbers as floats
+    """
+    return extract_numbers_generic(text, pronounce_number_en, extractnumber_en,
+                                   short_scale=short_scale, ordinals=ordinals)
 
 
 def normalize_en(text, remove_articles):

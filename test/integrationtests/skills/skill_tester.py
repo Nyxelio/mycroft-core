@@ -39,11 +39,16 @@ import re
 import ast
 from os.path import join, isdir, basename
 from pyee import EventEmitter
+from numbers import Number
 from mycroft.messagebus.message import Message
 from mycroft.skills.core import create_skill_descriptor, load_skill, \
     MycroftSkill, FallbackSkill
 from mycroft.skills.settings import SkillSettings
 from mycroft.configuration import Configuration
+
+from logging import StreamHandler
+from io import StringIO
+from contextlib import contextmanager
 
 MainModule = '__init__'
 
@@ -51,6 +56,10 @@ DEFAULT_EVALUAITON_TIMEOUT = 30
 
 # Set a configuration value to allow skills to check if they're in a test
 Configuration.get()['test_env'] = True
+
+
+class SkillTestError(Exception):
+    pass
 
 
 # Easy way to show colors on terminals
@@ -94,6 +103,20 @@ else:
     color = no_clr
 
 
+@contextmanager
+def temporary_handler(log, handler):
+    """Context manager to replace the default logger with a temporary logger.
+
+    Args:
+        log (LOG): mycroft LOG object
+        handler (logging.Handler): Handler object to use
+    """
+    old_handler = log.handler
+    log.handler = handler
+    yield
+    log.handler = old_handler
+
+
 def get_skills(skills_folder):
     """Find skills in the skill folder or sub folders.
 
@@ -135,16 +158,23 @@ def load_skills(emitter, skills_root):
             skills_root: Directory of the skills __init__.py
 
         Returns:
-            list: a list of loaded skills
+            tuple: (list of loaded skills, dict with logs for each skill)
 
     """
     skill_list = []
+    log = {}
     for skill in get_skills(skills_root):
         path = skill["path"]
         skill_id = 'test-' + basename(path)
-        skill_list.append(load_skill(skill, emitter, skill_id))
 
-    return skill_list
+        # Catch the logs during skill loading
+        from mycroft.skills.core import LOG as skills_log
+        buf = StringIO()
+        with temporary_handler(skills_log, StreamHandler(buf)):
+            skill_list.append(load_skill(skill, emitter, skill_id))
+        log[path] = buf.getvalue()
+
+    return skill_list, log
 
 
 def unload_skills(skills):
@@ -211,6 +241,8 @@ class MockSkillsLoader(object):
     """
 
     def __init__(self, skills_root):
+        self.load_log = None
+
         self.skills_root = skills_root
         self.emitter = InterceptEmitter()
         from mycroft.skills.intent_service import IntentService
@@ -222,14 +254,15 @@ class MockSkillsLoader(object):
             'intent_failure',
             FallbackSkill.make_intent_failure_handler(self.emitter))
 
-        def make_response(_):
-            data = dict(result=False)
+        def make_response(message):
+            skill_id = message.data.get('skill_id', '')
+            data = dict(result=False, skill_id=skill_id)
             self.emitter.emit(Message('skill.converse.response', data))
         self.emitter.on('skill.converse.request', make_response)
 
     def load_skills(self):
-        self.skills = load_skills(self.emitter, self.skills_root)
-        self.skills = [s for s in self.skills if s]
+        skills, self.load_log = load_skills(self.emitter, self.skills_root)
+        self.skills = [s for s in skills if s]
         self.ps.train(Message('', data=dict(single_thread=True)))
         return self.emitter.emitter  # kick out the underlying emitter
 
@@ -262,12 +295,17 @@ class SkillTest(object):
             Args:
                 loader:  A list of loaded skills
         """
-
         s = [s for s in loader.skills if s and s.root_dir == self.skill]
         if s:
             s = s[0]
         else:
-            raise Exception('Skill couldn\'t be loaded')
+            # The skill wasn't loaded, print the load log for the skill
+            if self.skill in loader.load_log:
+                print('\n {} Captured Logs from loading {}'.format('=' * 15,
+                                                                   '=' * 15))
+                print(loader.load_log.pop(self.skill))
+
+            raise SkillTestError('Skill couldn\'t be loaded')
 
         print("")
         print(color.HEADER + "="*20 + " RUNNING TEST " + "="*20 + color.RESET)
@@ -336,11 +374,26 @@ class SkillTest(object):
         # provided text to the skill engine for intent matching and it then
         # invokes the skill.
         utt = test_case.get('utterance', None)
-        print("UTTERANCE:", color.USER_UTT + utt + color.RESET)
-        self.emitter.emit(
-            'recognizer_loop:utterance',
-            Message('recognizer_loop:utterance',
-                    {'utterances': [utt]}))
+        play_utt = test_case.get('play_query', None)
+        play_start = test_case.get('play_start', None)
+        if utt:
+            print("UTTERANCE:", color.USER_UTT + utt + color.RESET)
+            self.emitter.emit(
+                'recognizer_loop:utterance',
+                Message('recognizer_loop:utterance',
+                        {'utterances': [utt]}))
+        elif play_utt:
+            print('PLAY QUERY', color.USER_UTT + play_utt + color.RESET)
+            self.emitter.emit('play:query', Message('play:query:',
+                                                    {'phrase': play_utt}))
+        elif play_start:
+            print('PLAY START')
+            callback_data = play_start
+            callback_data['skill_id'] = s.skill_id
+            self.emitter.emit('play:start',
+                              Message('play:start', callback_data))
+        else:
+            raise SkillTestError('No input utterance provided')
 
         # Wait up to X seconds for the test_case to complete
         timeout = time.time() + int(test_case.get('evaluation_timeout')) \
@@ -418,6 +471,17 @@ class EvaluationRule(object):
         if test_case.get('intent', None):
             for item in test_case['intent'].items():
                 _x.append(['equal', str(item[0]), str(item[1])])
+
+        if 'play_query_match' in test_case:
+            match = test_case['play_query_match']
+            print(test_case)
+            phrase = match.get('phrase', test_case.get('play_query'))
+            _d = ['and']
+            _d.append(['equal', '__type__', 'query'])
+            _d.append(['equal', 'skill_id', skill.skill_id])
+            _d.append(['equal', 'phrase', phrase])
+            _d.append(['gt', 'conf', match.get('confidence_threshold', 0.5)])
+            self.rule.append(_d)
 
         # Check for expected data structure
         if test_case.get('expected_data'):
@@ -532,6 +596,18 @@ class EvaluationRule(object):
 
         if rule[0] == 'equal':
             if self._get_field_value(rule[1], msg) != rule[2]:
+                return False
+
+        if rule[0] == 'lt':
+            if not isinstance(self._get_field_value(rule[1], msg), Number):
+                return False
+            if self._get_field_value(rule[1], msg) >= rule[2]:
+                return False
+
+        if rule[0] == 'gt':
+            if not isinstance(self._get_field_value(rule[1], msg), Number):
+                return False
+            if self._get_field_value(rule[1], msg) <= rule[2]:
                 return False
 
         if rule[0] == 'notEqual':

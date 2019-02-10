@@ -23,7 +23,7 @@ from mycroft.configuration import Configuration
 from mycroft.util.log import LOG
 
 
-class STT(object):
+class STT:
     __metaclass__ = ABCMeta
 
     def __init__(self):
@@ -93,6 +93,8 @@ class GoogleSTT(TokenSTT):
 class GoogleCloudSTT(GoogleJsonSTT):
     def __init__(self):
         super(GoogleCloudSTT, self).__init__()
+        # override language with module specific language selection
+        self.lang = self.config.get('lang') or self.lang
 
     def execute(self, audio, language=None):
         self.lang = language or self.lang
@@ -220,7 +222,7 @@ class GoVivaceSTT(TokenSTT):
         return response.json()["result"]["hypotheses"][0]["transcript"]
 
 
-class STTFactory(object):
+class STTFactory:
     CLASSES = {
         "mycroft": MycroftSTT,
         "google": GoogleSTT,

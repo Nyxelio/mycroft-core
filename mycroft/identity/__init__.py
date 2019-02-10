@@ -22,7 +22,7 @@ from mycroft.util.combo_lock import ComboLock
 identity_lock = ComboLock('/tmp/identity-lock')
 
 
-class DeviceIdentity(object):
+class DeviceIdentity:
     def __init__(self, **kwargs):
         self.uuid = kwargs.get("uuid", "")
         self.access = kwargs.get("access", "")
@@ -36,14 +36,12 @@ class DeviceIdentity(object):
         return self.refresh != ""
 
 
-class IdentityManager(object):
+class IdentityManager:
     __identity = None
 
     @staticmethod
     def _load():
         LOG.debug('Loading identity')
-        time.sleep(1.2)
-        os.sync()
         try:
             with FileSystemAccess('identity').open('identity2.json', 'r') as f:
                 IdentityManager.__identity = DeviceIdentity(**json.load(f))
